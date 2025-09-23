@@ -14,7 +14,7 @@ dependencies = [
 ]
 
 [project.scripts]
-mtrpy = "mtrpy.cli:main"
+mtr-logger = "mtrpy.cli:main"
 
 [tool.setuptools.packages.find]
 include = ["mtrpy*"]
