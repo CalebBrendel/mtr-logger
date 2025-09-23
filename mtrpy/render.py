@@ -1,5 +1,16 @@
+# mtrpy/render.py
+"""
+Render helpers for mtr-logger.
+
+- Rich TUI (interactive): `build_table(...)` + `console`  [backward compatible]
+- Plain text (export / non-TUI): `render_table(...)` -> delegates to export.render_report
+"""
+
 from __future__ import annotations
 from time import perf_counter
+from typing import Optional
+
+# --- Rich TUI (legacy/interactive) ---
 from rich.console import Console
 from rich.table import Table
 from rich import box
@@ -17,6 +28,9 @@ def _fmt_ms(v):
 
 
 def build_table(circuit: Circuit, target: str, started_at: float, ascii_mode: bool = False):
+    """
+    Rich Table used by interactive UI (via Live).
+    """
     t = Table(
         expand=False,
         box=box.SIMPLE if ascii_mode else box.ROUNDED,
@@ -39,3 +53,30 @@ def build_table(circuit: Circuit, target: str, started_at: float, ascii_mode: bo
             _fmt_ms(row.worst_ms),
         )
     return t
+
+
+# --- Plain text (export / non-TUI) ---
+from .export import render_report, DEFAULT_ORDER
+
+
+def render_table(
+    circuit: Circuit,
+    order: Optional[str] = None,
+    wide: bool = False,
+    ascii: bool = False,      # accepted for compatibility; not used in text export
+    no_screen: bool = False,  # accepted for compatibility; not used in text export
+) -> str:
+    """
+    Return a neatly aligned, plain-text table for the current circuit snapshot.
+    Used by the CLI when printing/exporting without Rich.
+
+    Args:
+        circuit: Circuit object with collected hop statistics.
+        order: mtr-style field order string (default "LSRABW").
+        wide: pass-through to export renderer (controls width policy).
+        ascii, no_screen: accepted for CLI compatibility; not used here.
+
+    Returns:
+        str: Rendered text table for display or logging.
+    """
+    return render_report(circuit, order=order or DEFAULT_ORDER, wide=wide)
