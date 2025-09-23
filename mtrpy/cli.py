@@ -4,6 +4,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import time
+from pathlib import Path
 from typing import Optional
 
 from .pinger import ping_host
@@ -28,7 +29,7 @@ async def mtr_loop(
     nprobes: int = 3,
     timeout: float = 5.0,
     proto: str = "icmp",
-    dns_mode: str = "auto",
+    dns_mode: str = "auto",  # passed to display only (trace() doesn't take it)
     fps: int = 6,
     use_ascii: bool = True,
     use_screen: bool = True,
@@ -44,20 +45,18 @@ async def mtr_loop(
     resolved = resolve_host(target)
     display_target = resolved.input if dns_mode != "off" else resolved.ip
 
-    # initial trace
+    # initial trace (NOTE: tracer.trace does NOT accept dns_mode)
     hops = await trace(
         resolved.ip,
         max_hops=max_hops,
         nprobes=nprobes,
         timeout=timeout,
         proto=proto,
-        dns_mode=dns_mode,
     )
 
     circuit = Circuit(hops=hops)
     started = time.perf_counter()
 
-    # If exporting only (no screen), we still do the ping loop for duration/count
     next_frame = 0.0
     end_time = None if duration is None else (time.perf_counter() + float(duration))
 
@@ -71,25 +70,21 @@ async def mtr_loop(
         if use_screen:
             now = time.perf_counter()
             if now >= next_frame:
-                # draw a frame
                 table_text = render_table(circuit, display_target, started, ascii_mode=use_ascii)
-                # We’re in plain ASCII mode; just print the frame separated by a blank line.
-                # (External TUI libs caused flicker; this is stable across SSH/VMs.)
                 print("\x1b[2J\x1b[H", end="")  # clear screen & home
                 print(table_text, end="")
-                # target ~fps frames per second
                 if fps > 0:
                     next_frame = now + (1.0 / fps)
 
         # duration control (used by cron/export)
         if end_time is not None and time.perf_counter() >= end_time:
-            # finish and export if requested
             if export_path is not None:
-                path = await export_report(circuit, display_target, export_path, order=export_order, wide=wide)
+                path = await export_report(
+                    circuit, display_target, export_path, order=export_order, wide=wide
+                )
                 return path
             return None
 
-        # pacing
         await asyncio.sleep(max(0.01, float(interval)))
 
 async def export_report(
@@ -106,27 +101,14 @@ async def export_report(
     Returns the path written.
     """
     if outfile == "auto":
-        out_path = auto_outfile_path(default_log_dir(), prefix="mtr")
+        p = auto_outfile_path(default_log_dir(), prefix="mtr")
     else:
-        out_path = ensure_dir(default_log_dir()) / outfile if not outfile.startswith("/") else ensure_dir(
-            (ensure_dir(default_log_dir()))  # noop, just to satisfy path type
-        ) or outfile  # will be treated as absolute below
+        p = Path(outfile)
+        if not p.is_absolute():
+            p = ensure_dir(default_log_dir()) / p.name
 
-        # Normalize to string path; if relative, place under default log dir
-        if not isinstance(out_path, str):
-            out_path = str(out_path)
-
-        if not out_path.startswith("/"):
-            out_path = str(ensure_dir(default_log_dir()) / outfile)
-
-    report = render_report(circuit, order=order, wide=wide)
-    # Ensure parent exists and write
-    if isinstance(out_path, str):
-        from pathlib import Path
-        p = Path(out_path)
-    else:
-        p = out_path
     p.parent.mkdir(parents=True, exist_ok=True)
+    report = render_report(circuit, order=order, wide=wide)
     p.write_text(report)
     return str(p)
 
@@ -145,7 +127,7 @@ def build_parser() -> argparse.ArgumentParser:
     ap.add_argument("--fps", type=int, default=6, help="Interactive refresh rate (frames per second)")
     ap.add_argument("--ascii", action="store_true", help="Use ASCII borders/clear; stable over SSH/VMs")
     ap.add_argument("--no-screen", action="store_true", help="Disable interactive screen updates (batch mode)")
-    ap.add_argument("--dns", choices=("auto", "on", "off"), default="auto", help="Hop name resolution mode")
+    ap.add_argument("--dns", choices=("auto", "on", "off"), default="auto", help="Hop name resolution for display")
     # logging / export controls
     ap.add_argument("--count", type=int, default=None, help="(Deprecated) number of ping rounds (use --duration instead)")
     ap.add_argument("--duration", type=int, default=None, help="Run for N seconds then exit (good for cron)")
@@ -161,16 +143,12 @@ def main(argv: list[str] | None = None) -> int:
     ap = build_parser()
     args = ap.parse_args(argv)
 
-    # normalize options
     use_screen = not args.no_screen
+
     export_path: Optional[str] = None
     if args.export:
-        if args.outfile == "auto":
-            export_path = "auto"
-        else:
-            export_path = args.outfile
+        export_path = args.outfile  # "auto" or explicit path
 
-    # run
     try:
         path = asyncio.run(
             mtr_loop(
