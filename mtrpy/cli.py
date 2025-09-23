@@ -23,8 +23,10 @@ def _collapse_at_destination(hops: List[Hop], target_ip: Optional[str] = None) -
     out: List[Hop] = []
     for h in hops:
         out.append(h)
-        # Support both address (IP) and display (hostname/IP)
-        if (h.address and h.address == target_ip) or (getattr(h, "display", None) == target_ip):
+        # Support both address (IP) and display (hostname/IP) if present
+        if (getattr(h, "address", None) and h.address == target_ip) or (
+            getattr(h, "display", None) == target_ip
+        ):
             break
     return out
 
@@ -60,7 +62,7 @@ async def mtr_loop(
     )
     hops = _collapse_at_destination(hops)
     for h in hops:
-        name = getattr(h, "display", h.address)
+        name = getattr(h, "display", None) or getattr(h, "address", None)
         circuit.update_hop_samples(h.ttl, name, h.rtts_ms)
 
     with Live(
@@ -77,7 +79,7 @@ async def mtr_loop(
             )
             hops = _collapse_at_destination(hops)
             for h in hops:
-                name = getattr(h, "display", h.address)
+                name = getattr(h, "display", None) or getattr(h, "address", None)
                 circuit.update_hop_samples(h.ttl, name, h.rtts_ms)
 
             live.update(build_table(circuit, target, started, ascii_mode=ascii_mode))
@@ -105,7 +107,7 @@ async def run_export_session(
     probe_timeout: float = 2.0,
     proto: str = "udp",
     dns_mode: str = "auto",
-    duration: float = 0.0,  # NEW: wall-clock seconds to sample before exporting (overrides --count)
+    duration: float = 0.0,  # wall-clock seconds to sample before exporting (overrides --count)
 ) -> int:
     """
     Export a snapshot after either:
@@ -124,7 +126,7 @@ async def run_export_session(
             )
             hops = _collapse_at_destination(hops)
             for h in hops:
-                name = getattr(h, "display", h.address)
+                name = getattr(h, "display", None) or getattr(h, "address", None)
                 circuit.update_hop_samples(h.ttl, name, h.rtts_ms)
             if perf_counter() >= end_at:
                 break
@@ -138,7 +140,7 @@ async def run_export_session(
             )
             hops = _collapse_at_destination(hops)
             for h in hops:
-                name = getattr(h, "display", h.address)
+                name = getattr(h, "display", None) or getattr(h, "address", None)
                 circuit.update_hop_samples(h.ttl, name, h.rtts_ms)
             await asyncio.sleep(max(0.0, interval - (perf_counter() - t0)))
 
@@ -170,7 +172,7 @@ async def run_with_hourly_logs(
             )
             hops = _collapse_at_destination(hops)
             for h in hops:
-                name = getattr(h, "display", h.address)
+                name = getattr(h, "display", None) or getattr(h, "address", None)
                 circuit.update_hop_samples(h.ttl, name, h.rtts_ms)
             await asyncio.sleep(max(0.0, interval - (perf_counter() - t0)))
 
@@ -186,7 +188,10 @@ async def run_with_hourly_logs(
 
 
 def main(argv: Optional[list[str]] = None) -> int:
-    ap = argparse.ArgumentParser(prog="mtrpy", description="Cross-platform MTR-style network diagnostic")
+    ap = argparse.ArgumentParser(
+        prog="mtr-logger",
+        description="Cross-platform MTR-style network diagnostic"
+    )
     ap.add_argument("target", help="Hostname or IP to trace")
     ap.add_argument("--interval", "-i", type=float, default=1.0, help="Seconds between refresh / sampling loop")
     ap.add_argument("--max-hops", "-m", type=int, default=30)
@@ -236,7 +241,7 @@ def main(argv: Optional[list[str]] = None) -> int:
                 probe_timeout=args.timeout,
                 proto=args.proto,
                 dns_mode=args.dns,
-                duration=args.duration,  # NEW
+                duration=args.duration,
             )
         )
 
@@ -276,4 +281,5 @@ def main(argv: Optional[list[str]] = None) -> int:
     return 0
 
 
+# convenience entry
 run = main
