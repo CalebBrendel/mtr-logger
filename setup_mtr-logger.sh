@@ -5,6 +5,7 @@
 # - Ensures cron is enabled/started (systemd, SysV/service, OpenRC, BusyBox crond)
 # - Tries to grant cap_net_raw to venv python; falls back gracefully if unavailable
 # - Sanitizes prompt input and validates Git URL (shell-safe)
+# - Adds midnight archiving cron with 90-day retention (configurable by editing crontab)
 
 set -euo pipefail
 
@@ -24,19 +25,17 @@ ASCII_DEFAULT="yes"
 USE_SCREEN_DEFAULT="yes"
 
 LOGS_PER_HOUR_DEFAULT="4"  # e.g., 0,15,30,45
-SAFETY_MARGIN_DEFAULT="0"  # seconds subtracted from each window; 0 = full window
+SAFETY_MARGIN_DEFAULT="5"  # seconds subtracted from each window; 0 = full window
+ARCHIVE_RETENTION_DEFAULT="90"
 # --------------------------------------------
 
 sanitize_input() {
-  # Strip ANSI escape sequences and non-printables, trim spaces
   sed -E 's/\x1B\[[0-9;]*[A-Za-z]//g' \
   | tr -cd '\11\12\15\40-\176' \
   | sed -E 's/^[[:space:]]+//; s/[[:space:]]+$//'
 }
 
 is_valid_git_url() {
-  # Shell-safe heuristic instead of regex:
-  # Accept https://... or git@host:owner/repo(.git)
   case "${1:-}" in
     https://*) return 0 ;;
     git@*:* )  return 0 ;;
@@ -74,7 +73,7 @@ detect_pm() {
 
 install_deps() {
   local pm="$1"
-  echo "[1/10] Installing system dependencies (pm: $pm)..."
+  echo "[1/11] Installing system dependencies (pm: $pm)..."
   case "$pm" in
     apt)
       apt-get update -y
@@ -106,9 +105,8 @@ install_deps() {
 }
 
 start_cron_service() {
-  echo "[2/10] Ensuring cron service is enabled and running..."
+  echo "[2/11] Ensuring cron service is enabled and running..."
 
-  # Prefer systemd if usable (not just present in a container)
   if command -v systemctl >/dev/null 2>&1; then
     if systemctl is-system-running >/dev/null 2>&1 || systemctl list-units >/dev/null 2>&1; then
       for svc in cron crond cronie; do
@@ -124,21 +122,18 @@ start_cron_service() {
     fi
   fi
 
-  # SysV/service fallback
   if command -v service >/dev/null 2>&1; then
     for svc in cron crond cronie; do
       service "$svc" start 2>/dev/null || true
     done
   fi
 
-  # init.d direct fallback
   for path in /etc/init.d/cron /etc/init.d/crond /etc/init.d/cronie; do
     if [[ -x "$path" ]]; then
       "$path" start 2>/dev/null || true
     fi
   done
 
-  # BusyBox/OpenRC direct fallback
   if command -v rc-service >/dev/null 2>&1; then
     rc-update add crond default 2>/dev/null || true
     rc-service crond start 2>/dev/null || true
@@ -147,7 +142,6 @@ start_cron_service() {
     crond 2>/dev/null || true
   fi
 
-  # Verify by process presence
   if pgrep -x cron >/dev/null 2>&1 || pgrep -x crond >/dev/null 2>&1; then
     echo "    - cron/crond is running"
     return 0
@@ -267,10 +261,10 @@ main() {
   echo
 
   # ---- Clone/Update ----
-  echo "[3/10] Preparing install root: $PREFIX"
+  echo "[3/11] Preparing install root: $PREFIX"
   mkdir -p "$PREFIX"
 
-  echo "[4/10] Cloning/updating repo..."
+  echo "[4/11] Cloning/updating repo..."
   if [[ -d "$SRC_DIR/.git" ]]; then
     git -C "$SRC_DIR" remote set-url origin "$GIT_URL"
     git -C "$SRC_DIR" fetch origin --depth=1
@@ -283,16 +277,16 @@ main() {
   [[ -f "$SRC_DIR/pyproject.toml" ]] || { echo "pyproject.toml not found in $SRC_DIR" >&2; exit 1; }
 
   # ---- Venv & Install ----
-  echo "[5/10] Creating virtualenv: $VENV_DIR"
+  echo "[5/11] Creating virtualenv: $VENV_DIR"
   python3 -m venv "$VENV_DIR"
   # shellcheck disable=SC1090
   source "$VENV_DIR/bin/activate"
   python -m pip install -U pip wheel
-  echo "[6/10] Installing package (editable)..."
+  echo "[6/11] Installing package (editable)..."
   pip install -e "$SRC_DIR"
 
   # ---- Try to grant cap_net_raw (graceful fallback) ----
-  echo "[7/10] Granting CAP_NET_RAW to venv python (best effort)..."
+  echo "[7/11] Granting CAP_NET_RAW to venv python (best effort)..."
   PYBIN="$VENV_DIR/bin/python3"
   [[ -x "$PYBIN" ]] || PYBIN="$VENV_DIR/bin/python"
   if ! try_setcap_cap_net_raw "$PYBIN"; then
@@ -300,7 +294,7 @@ main() {
   fi
 
   # ---- Wrapper ----
-  echo "[8/10] Creating wrapper: $WRAPPER"
+  echo "[8/11] Creating wrapper: $WRAPPER"
   cat > "$WRAPPER" <<WRAP
 #!/usr/bin/env bash
 set -euo pipefail
@@ -310,18 +304,32 @@ exec "\$VENV/bin/python" -m mtrpy "\$@"
 WRAP
   chmod +x "$WRAPPER"
 
-  # ---- Cron ----
-  echo "[9/10] Writing cron (root) ..."
+  # ---- Cron: logging ----
+  echo "[9/11] Writing cron entries (root) ..."
   local ASCII_FLAG=""; [[ "$ASCII" == "yes" ]] && ASCII_FLAG="--ascii"
   local SCREEN_FLAG=""; [[ "$USE_SCREEN" == "no" ]] && SCREEN_FLAG="--no-screen"
 
-  local CRONLINE="${MINUTES} * * * * flock -n /var/run/mtr-logger.lock \
+  local CRONLINE_LOG="${MINUTES} * * * * flock -n /var/run/mtr-logger.lock \
 $WRAPPER \"$TARGET\" --proto \"$PROTO\" --dns \"$DNS_MODE\" -i \"$INTERVAL\" -p \"$PROBES\" --duration \"$DURATION\" \
 --export --outfile auto >> /var/log/mtr-logger.log 2>&1"
 
-  (crontab -l 2>/dev/null | grep -v 'mtr-logger.lock' || true; echo "$CRONLINE") | crontab -
+  # ---- Cron: daily archiving ----
+  local CRONLINE_ARCHIVE="0 0 * * * flock -n /var/run/mtr-archive.lock \
+$VENV_DIR/bin/python -m mtrpy.archiver --retention $ARCHIVE_RETENTION_DEFAULT >> /var/log/mtr-logger-archive.log 2>&1"
 
-  echo "[10/10] Done."
+  # Install/replace both lines; remove any previous entries we own
+  (crontab -l 2>/dev/null | grep -v -E 'mtr-logger\.lock|mtr-archive\.lock' || true; \
+    echo "$CRONLINE_LOG"; \
+    echo "$CRONLINE_ARCHIVE" \
+  ) | crontab -
+
+  echo "[10/11] Self-test (non-fatal if it fails) ..."
+  set +e
+  TEST_PATH="$("$WRAPPER" "$TARGET" --proto tcp --dns "$DNS_MODE" -i "$INTERVAL" -p "$PROBES" --duration 5 --export --outfile auto 2>/dev/null | tail -n1)"
+  set -e
+  [[ -n "${TEST_PATH:-}" ]] && echo "    - Test log: $TEST_PATH" || echo "    - Self-test not conclusive."
+
+  echo "[11/11] Done."
   cat <<INFO
 
 ✅ Install complete.
@@ -330,13 +338,16 @@ Run interactively:
   mtr-logger $TARGET --proto $PROTO -i $INTERVAL -p $PROBES $ASCII_FLAG $SCREEN_FLAG
 
 Cron (root):
-  $CRONLINE
+  $CRONLINE_LOG
+
+Archiver (daily at 00:00):
+  $CRONLINE_ARCHIVE
 
 Notes:
 - If CAP_NET_RAW couldn't be applied, ICMP may need sudo; 'tcp' works unprivileged:
     mtr-logger $TARGET --proto tcp
-- Logs appear under the invoking user's home (root → /root/mtr/logs).
-- To change schedule later, re-run this bootstrap or:  sudo crontab -e
+- Logs live in ~/mtr/logs; archives in ~/mtr/logs/archive/MM-DD-YYYY
+- Retention is 90 days by default; edit root crontab to change.
 INFO
 }
 
