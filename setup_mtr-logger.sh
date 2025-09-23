@@ -2,7 +2,7 @@
 # Universal mtr-logger bootstrap installer (Linux)
 # - Supports apt/dnf/yum/zypper/pacman/apk
 # - Installs deps, clones repo, creates venv, adds wrapper, prompts for schedule, writes cron
-# - Ensures cron is enabled/started
+# - Ensures cron is enabled/started (systemd, SysV/service, OpenRC, BusyBox crond)
 # - Tries to grant cap_net_raw to venv python; falls back gracefully if unavailable
 
 set -euo pipefail
@@ -89,22 +89,55 @@ install_deps() {
 
 start_cron_service() {
   echo "[2/10] Ensuring cron service is enabled and running..."
+
+  # Prefer systemd if it's actually usable (not just present in containers)
   if command -v systemctl >/dev/null 2>&1; then
+    if systemctl is-system-running >/dev/null 2>&1 || systemctl list-units >/dev/null 2>&1; then
+      for svc in cron crond cronie; do
+        if systemctl list-unit-files 2>/dev/null | grep -q "^${svc}\.service"; then
+          systemctl enable --now "$svc" 2>/dev/null || true
+          systemctl start "$svc" 2>/dev/null || true
+          if systemctl is-active --quiet "$svc"; then
+            echo "    - ${svc} is active (systemd)"
+            return 0
+          fi
+        fi
+      done
+    fi
+  fi
+
+  # SysV/service fallback
+  if command -v service >/dev/null 2>&1; then
     for svc in cron crond cronie; do
-      if systemctl list-unit-files | grep -q "^${svc}\.service"; then
-        systemctl enable --now "${svc}" 2>/dev/null || true
-        systemctl start "${svc}" 2>/dev/null || true
-        systemctl is-active --quiet "${svc}" && { echo "    - ${svc} is active"; return 0; }
-      fi
+      service "$svc" start 2>/dev/null || true
     done
-    echo "    - Could not verify an active cron unit; please check manually."
-  elif command -v rc-service >/dev/null 2>&1; then
+  fi
+
+  # init.d direct fallback
+  for path in /etc/init.d/cron /etc/init.d/crond /etc/init.d/cronie; do
+    if [[ -x "$path" ]]; then
+      "$path" start 2>/dev/null || true
+    fi
+  done
+
+  # BusyBox/OpenRC direct fallback
+  if command -v rc-service >/dev/null 2>&1; then
     rc-update add crond default 2>/dev/null || true
     rc-service crond start 2>/dev/null || true
-    echo "    - crond started via OpenRC"
-  else
-    echo "    - No supported service manager detected (systemd/OpenRC)."
   fi
+  if command -v crond >/dev/null 2>&1; then
+    # Start foreground once to spawn (some BusyBox setups)
+    crond 2>/dev/null || true
+  fi
+
+  # Verify by process presence
+  if pgrep -x cron >/dev/null 2>&1 || pgrep -x crond >/dev/null 2>&1; then
+    echo "    - cron/crond is running"
+    return 0
+  fi
+
+  echo "    - Could not verify an active cron unit; please check manually."
+  return 1
 }
 
 validate_factor_of_60() {
@@ -141,13 +174,11 @@ try_setcap_cap_net_raw() {
     return 1
   fi
 
-  # Try to set the capability
   if ! setcap cap_net_raw+ep "$pybin" 2>/dev/null; then
     echo "    - setcap failed (filesystem may not support file capabilities). ICMP may require sudo."
     return 1
   fi
 
-  # Verify with getcap if present
   if command -v getcap >/dev/null 2>&1; then
     if ! getcap "$pybin" | grep -q 'cap_net_raw'; then
       echo "    - getcap verification did not show cap_net_raw; ICMP may still require sudo."
