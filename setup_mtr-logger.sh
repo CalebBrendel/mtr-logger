@@ -1,7 +1,13 @@
 #!/usr/bin/env bash
+# Universal mtr-logger bootstrap installer (Linux)
+# - Supports apt/dnf/yum/zypper/pacman/apk
+# - Installs deps, clones repo, creates venv, adds wrapper, prompts for schedule, writes cron
+# - Ensures cron is enabled/started
+# - Tries to grant cap_net_raw to venv python; falls back gracefully if unavailable
+
 set -euo pipefail
 
-# Defaults
+# ----------------- Defaults -----------------
 GIT_URL_DEFAULT="https://github.com/CalebBrendel/mtr-logger.git"
 BRANCH_DEFAULT="main"
 PREFIX_DEFAULT="/opt/mtr-logger"
@@ -16,22 +22,9 @@ FPS_DEFAULT="6"
 ASCII_DEFAULT="yes"
 USE_SCREEN_DEFAULT="yes"
 
-LOGS_PER_HOUR_DEFAULT="4"
-SAFETY_MARGIN_DEFAULT="0"   # 0 = full window
-SETCAP_DEFAULT="yes"        # default: grant CAP_NET_RAW to venv python
-
-# ---- flag parsing (optional) ----
-SETCAP_FLAG=""
-while [[ $# -gt 0 ]]; do
-  case "$1" in
-    --setcap-icmp)
-      SETCAP_FLAG="${2:-}"; shift 2 ;;
-    --no-setcap)
-      SETCAP_FLAG="no"; shift 1 ;;
-    *)
-      echo "Unknown flag: $1"; exit 2 ;;
-  esac
-done
+LOGS_PER_HOUR_DEFAULT="4"  # e.g., 0,15,30,45
+SAFETY_MARGIN_DEFAULT="5"  # seconds subtracted from each window; 0 = full window
+# --------------------------------------------
 
 ask() {
   local label="$1" default="$2" ans=""
@@ -63,6 +56,7 @@ detect_pm() {
 install_deps() {
   local pm="$1"
   echo "[1/10] Installing system dependencies (pm: $pm)..."
+
   case "$pm" in
     apt)
       apt-get update -y
@@ -87,19 +81,29 @@ install_deps() {
       apk add python3 py3-virtualenv py3-pip git traceroute curl dcron ca-certificates libcap
       ;;
     *)
-      echo "Unsupported distro: install Python 3, venv, pip, git, traceroute, curl, cron, libcap manually." >&2
+      echo "Unsupported distro: please install Python 3, venv, pip, git, traceroute, curl, cron, libcap manually." >&2
       exit 1
       ;;
   esac
+}
 
-  # enable cron where applicable
+start_cron_service() {
+  echo "[2/10] Ensuring cron service is enabled and running..."
   if command -v systemctl >/dev/null 2>&1; then
-    systemctl enable --now crond 2>/dev/null || true
-    systemctl enable --now cron  2>/dev/null || true
-    systemctl enable --now cronie 2>/dev/null || true
+    for svc in cron crond cronie; do
+      if systemctl list-unit-files | grep -q "^${svc}\.service"; then
+        systemctl enable --now "${svc}" 2>/dev/null || true
+        systemctl start "${svc}" 2>/dev/null || true
+        systemctl is-active --quiet "${svc}" && { echo "    - ${svc} is active"; return 0; }
+      fi
+    done
+    echo "    - Could not verify an active cron unit; please check manually."
   elif command -v rc-service >/dev/null 2>&1; then
-    rc-service crond start 2>/dev/null || true
     rc-update add crond default 2>/dev/null || true
+    rc-service crond start 2>/dev/null || true
+    echo "    - crond started via OpenRC"
+  else
+    echo "    - No supported service manager detected (systemd/OpenRC)."
   fi
 }
 
@@ -123,15 +127,51 @@ minutes_list() {
   printf "%s\n" "${out%,}"
 }
 
+try_setcap_cap_net_raw() {
+  # Attempts to grant CAP_NET_RAW to the given python binary.
+  # Returns 0 on success, 1 on failure (prints a warning).
+  local pybin="$1"
+
+  if [[ ! -x "$pybin" ]]; then
+    echo "    - Python binary not found at $pybin (skipping setcap)."
+    return 1
+  fi
+  if ! command -v setcap >/dev/null 2>&1; then
+    echo "    - 'setcap' not available on this system; ICMP may require sudo."
+    return 1
+  fi
+
+  # Try to set the capability
+  if ! setcap cap_net_raw+ep "$pybin" 2>/dev/null; then
+    echo "    - setcap failed (filesystem may not support file capabilities). ICMP may require sudo."
+    return 1
+  fi
+
+  # Verify with getcap if present
+  if command -v getcap >/dev/null 2>&1; then
+    if ! getcap "$pybin" | grep -q 'cap_net_raw'; then
+      echo "    - getcap verification did not show cap_net_raw; ICMP may still require sudo."
+      return 1
+    fi
+  fi
+
+  echo "    - cap_net_raw granted to $pybin"
+  return 0
+}
+
 main() {
   require_root
-  echo "== mtr-logger bootstrap (universal, setcap default on) =="
+  echo "== mtr-logger bootstrap (universal) =="
 
   local PM; PM="$(detect_pm)"
-  [[ "$PM" != "none" ]] || { echo "No supported package manager found."; exit 1; }
+  if [[ "$PM" == "none" ]]; then
+    echo "No supported package manager found. Aborting." >&2
+    exit 1
+  fi
   install_deps "$PM"
+  start_cron_service
 
-  # Prompts
+  # ---- Prompts ----
   local GIT_URL BRANCH PREFIX WRAPPER
   GIT_URL="$(ask "Git URL" "$GIT_URL_DEFAULT")"
   BRANCH="$(ask "Branch" "$BRANCH_DEFAULT")"
@@ -156,14 +196,6 @@ main() {
   fi
   SAFETY="$(ask "Safety margin seconds (subtract from each window)" "$SAFETY_MARGIN_DEFAULT")"
 
-  # decide setcap (flag overrides prompt default)
-  local SETCAP_ANSWER
-  if [[ -n "${SETCAP_FLAG:-}" ]]; then
-    SETCAP_ANSWER="$SETCAP_FLAG"
-  else
-    SETCAP_ANSWER="$(ask "Grant CAP_NET_RAW to venv python for ICMP without sudo? (yes/no)" "$SETCAP_DEFAULT")"
-  fi
-
   local SRC_DIR="$PREFIX/src" VENV_DIR="$PREFIX/.venv"
 
   # Compute schedule & duration
@@ -182,14 +214,13 @@ main() {
   echo "  Minute marks:      $MINUTES"
   echo "  Window seconds:    $WINDOW_SEC"
   echo "  Duration seconds:  $DURATION (window - safety)"
-  echo "  Setcap (ICMP w/o sudo): $SETCAP_ANSWER"
   echo
 
-  # Clone / update
-  echo "[2/10] Preparing install root: $PREFIX"
+  # ---- Clone/Update ----
+  echo "[3/10] Preparing install root: $PREFIX"
   mkdir -p "$PREFIX"
 
-  echo "[3/10] Cloning/updating repo..."
+  echo "[4/10] Cloning/updating repo..."
   if [[ -d "$SRC_DIR/.git" ]]; then
     git -C "$SRC_DIR" remote set-url origin "$GIT_URL"
     git -C "$SRC_DIR" fetch origin --depth=1
@@ -201,18 +232,25 @@ main() {
   fi
   [[ -f "$SRC_DIR/pyproject.toml" ]] || { echo "pyproject.toml not found in $SRC_DIR" >&2; exit 1; }
 
-  # Venv & install
-  echo "[4/10] Creating virtualenv: $VENV_DIR"
+  # ---- Venv & Install ----
+  echo "[5/10] Creating virtualenv: $VENV_DIR"
   python3 -m venv "$VENV_DIR"
   # shellcheck disable=SC1090
   source "$VENV_DIR/bin/activate"
   python -m pip install -U pip wheel
-
-  echo "[5/10] Installing package (editable)..."
+  echo "[6/10] Installing package (editable)..."
   pip install -e "$SRC_DIR"
 
-  # Wrapper
-  echo "[6/10] Creating wrapper: $WRAPPER"
+  # ---- Try to grant cap_net_raw (graceful fallback) ----
+  echo "[7/10] Granting CAP_NET_RAW to venv python (best effort)..."
+  PYBIN="$VENV_DIR/bin/python3"
+  [[ -x "$PYBIN" ]] || PYBIN="$VENV_DIR/bin/python"
+  if ! try_setcap_cap_net_raw "$PYBIN"; then
+    echo "WARNING: Continuing without file capabilities. ICMP may require sudo (or use --proto tcp)." >&2
+  fi
+
+  # ---- Wrapper ----
+  echo "[8/10] Creating wrapper: $WRAPPER"
   cat > "$WRAPPER" <<WRAP
 #!/usr/bin/env bash
 set -euo pipefail
@@ -222,35 +260,7 @@ exec "\$VENV/bin/python" -m mtrpy "\$@"
 WRAP
   chmod +x "$WRAPPER"
 
-  # setcap (optional, default yes)
-  echo "[7/10] Applying CAP_NET_RAW (if requested)..."
-  if [[ "${SETCAP_ANSWER,,}" == "yes" ]]; then
-    if command -v setcap >/dev/null 2>&1; then
-      PYBIN="$VENV_DIR/bin/python3"
-      [[ -x "$PYBIN" ]] || PYBIN="$VENV_DIR/bin/python"
-      if [[ -x "$PYBIN" ]]; then
-        setcap cap_net_raw=ep "$PYBIN" || true
-      fi
-    else
-      echo "WARNING: setcap not found; cannot grant CAP_NET_RAW. ICMP may require sudo."
-    fi
-  else
-    echo "Skipping setcap per selection."
-  fi
-
-  # Self-test
-  echo "[8/10] Self-test (TCP, non-root) ..."
-  set +e
-  TEST_PATH="$("$WRAPPER" "$TARGET" --proto tcp --dns "$DNS_MODE" -i "$INTERVAL" -p "$PROBES" --duration 5 --export --outfile auto 2>/dev/null | tail -n1)"
-  STATUS=$?
-  set -e
-  if [[ $STATUS -ne 0 || -z "${TEST_PATH:-}" ]]; then
-    echo "Self-test failed (non-fatal). Try: $WRAPPER $TARGET --proto tcp --duration 5 --export --outfile auto"
-  else
-    echo "Self-test example log: $TEST_PATH"
-  fi
-
-  # Cron
+  # ---- Cron ----
   echo "[9/10] Writing cron (root) ..."
   local ASCII_FLAG=""; [[ "$ASCII" == "yes" ]] && ASCII_FLAG="--ascii"
   local SCREEN_FLAG=""; [[ "$USE_SCREEN" == "no" ]] && SCREEN_FLAG="--no-screen"
@@ -273,9 +283,10 @@ Cron (root):
   $CRONLINE
 
 Notes:
-- With CAP_NET_RAW applied, you can run ICMP without sudo:  mtr-logger 8.8.8.8 --proto icmp
-- To change schedule later, re-run this bootstrap or:  sudo crontab -e
+- If CAP_NET_RAW couldn't be applied, ICMP may need sudo; 'tcp' works unprivileged:
+    mtr-logger $TARGET --proto tcp
 - Logs appear under the invoking user's home (root → /root/mtr/logs).
+- To change schedule later, re-run this bootstrap or:  sudo crontab -e
 INFO
 }
 
