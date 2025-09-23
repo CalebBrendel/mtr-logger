@@ -1,0 +1,21 @@
+[build-system]
+requires = ["setuptools>=61", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "mtrpy"
+version = "0.1.0"
+description = "Cross-platform MTR-style network diagnostic in Python (no raw sockets required)"
+requires-python = ">=3.9"
+authors = [{ name = "You" }]
+dependencies = [
+  "rich>=13.0.0",
+  "icmplib>=3.0",
+]
+
+[project.scripts]
+mtrpy = "mtrpy.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["mtrpy*"]
+
