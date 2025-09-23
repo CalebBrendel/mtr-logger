@@ -1,6 +1,7 @@
 from __future__ import annotations
 from typing import Callable, List, Tuple
 from datetime import datetime
+import os
 from .stats import Circuit
 
 # Field code -> (Header, extractor)
@@ -21,7 +22,6 @@ def _truncate(s: str, maxlen: int) -> str:
         return s
     if maxlen <= 1:
         return s[:maxlen]
-    # keep as much as possible and add ellipsis
     return s[: maxlen - 1] + "…"
 
 def render_report(
@@ -33,9 +33,10 @@ def render_report(
 ) -> str:
     """
     Returns a neatly aligned text table and an 'Alerts' footer for hops with packet loss.
-    - Address column grows to fit data up to addr_max (trim w/ ellipsis beyond that).
-    - Numeric columns sized to longest datum or header, right-aligned.
-    - 'wide' currently keeps same structure; TUI handles true wide view.
+    Default alert policy:
+      - Alert only when a hop had SOME replies but not all (Recv > 0 and Sent > Recv).
+      - Ignore fully non-responsive hops (Recv == 0) or address == '*', which are often ICMP rate-limited.
+    Power users can include non-responsive hops by setting env var MTR_LOGGER_ALERT_NONRESP=1.
     """
     # Column spec: Hop, Address, then fields per 'order'
     cols: List[Tuple[str, Callable, str]] = []  # (header, extractor(row), align "<" or ">")
@@ -47,7 +48,6 @@ def render_report(
             hdr, fn = meta
             cols.append((hdr, fn, ">"))
 
-    # Gather rows from stats
     rows = circuit.as_rows()
 
     # Determine Address width dynamically (respect min/max)
@@ -72,9 +72,7 @@ def render_report(
         widths.append(w)
 
     # Build row format string
-    parts = []
-    for (hdr, _fn, align), w in zip(cols, widths):
-        parts.append(f"{{:{align}{w}}}")
+    parts = [f"{{:{align}{w}}}" for (_hdr, _fn, align), w in zip(cols, widths)]
     row_fmt = "  ".join(parts)
 
     # Header line
@@ -96,17 +94,28 @@ def render_report(
                 vals.append(str(fn(r)))
         lines.append(row_fmt.format(*vals))
 
-    # --- Alerts footer: list any hops with packet loss ---
+    # --- Alerts footer ---
+    include_nonresponsive = os.environ.get("MTR_LOGGER_ALERT_NONRESP", "0") not in ("0", "", "false", "False", "no", "No")
     alert_lines: List[str] = []
     for r in rows:
-        # Determine lost packets from Snt/Recv
+        # Pull Snt/Recv safely
         try:
             sent = int(getattr(r, "sent", 0))
             recv = int(getattr(r, "recv", 0))
         except (TypeError, ValueError):
             sent, recv = 0, 0
         lost = max(0, sent - recv)
-        if lost > 0:
+        addr = (r.address or "*")
+
+        # Default behavior: only alert if the hop responded at least once (recv>0) and lost>0
+        # Ignore non-responsive hops (recv==0) and '*' unless explicitly overridden via env.
+        should_alert = False
+        if include_nonresponsive:
+            should_alert = (lost > 0)
+        else:
+            should_alert = (lost > 0 and recv > 0 and addr != "*")
+
+        if should_alert:
             ts = datetime.now().strftime("%I:%M:%S%p")  # 12-hour with AM/PM
             alert_lines.append(f"❌ Packet loss detected on hop {r.ttl} at {ts} - {lost} packets were lost")
 
