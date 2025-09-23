@@ -4,6 +4,7 @@
 # - Installs deps, clones repo, creates venv, adds wrapper, prompts for schedule, writes cron
 # - Ensures cron is enabled/started (systemd, SysV/service, OpenRC, BusyBox crond)
 # - Tries to grant cap_net_raw to venv python; falls back gracefully if unavailable
+# - NEW: Sanitizes prompt input (strips arrow-key escape codes) and validates Git URL
 
 set -euo pipefail
 
@@ -26,6 +27,20 @@ LOGS_PER_HOUR_DEFAULT="4"  # e.g., 0,15,30,45
 SAFETY_MARGIN_DEFAULT="5"  # seconds subtracted from each window; 0 = full window
 # --------------------------------------------
 
+sanitize_input() {
+  # Strip ANSI escape sequences and non-printables, trim spaces
+  # shellcheck disable=SC2001
+  sed -E 's/\x1B\[[0-9;]*[A-Za-z]//g' \
+  | tr -cd '\11\12\15\40-\176' \
+  | sed -E 's/^[[:space:]]+//; s/[[:space:]]+$//'
+}
+
+is_valid_git_url() {
+  # Accept https or ssh git URLs
+  local u="${1:-}"
+  [[ "$u" =~ ^https://[A-Za-z0-9._~:/?#@!$&'()*+,;=%-]+$ ]] || [[ "$u" =~ ^git@[^:]+:[A-Za-z0-9._/-]+(\.git)?$ ]]
+}
+
 ask() {
   local label="$1" default="$2" ans=""
   if [[ -t 0 ]]; then
@@ -33,7 +48,8 @@ ask() {
   else
     read -r -p "$label [$default]: " ans < /dev/tty
   fi
-  printf "%s\n" "${ans:-$default}"
+  ans="$(printf "%s" "${ans:-$default}" | sanitize_input)"
+  printf "%s\n" "${ans}"
 }
 
 require_root() {
@@ -90,7 +106,7 @@ install_deps() {
 start_cron_service() {
   echo "[2/10] Ensuring cron service is enabled and running..."
 
-  # Prefer systemd if it's actually usable (not just present in containers)
+  # Prefer systemd if usable (not just present in a container)
   if command -v systemctl >/dev/null 2>&1; then
     if systemctl is-system-running >/dev/null 2>&1 || systemctl list-units >/dev/null 2>&1; then
       for svc in cron crond cronie; do
@@ -115,9 +131,7 @@ start_cron_service() {
 
   # init.d direct fallback
   for path in /etc/init.d/cron /etc/init.d/crond /etc/init.d/cronie; do
-    if [[ -x "$path" ]]; then
-      "$path" start 2>/dev/null || true
-    fi
+    [[ -x "$path" ]] && "$path" start 2>/dev/null || true
   done
 
   # BusyBox/OpenRC direct fallback
@@ -126,7 +140,6 @@ start_cron_service() {
     rc-service crond start 2>/dev/null || true
   fi
   if command -v crond >/dev/null 2>&1; then
-    # Start foreground once to spawn (some BusyBox setups)
     crond 2>/dev/null || true
   fi
 
@@ -161,10 +174,7 @@ minutes_list() {
 }
 
 try_setcap_cap_net_raw() {
-  # Attempts to grant CAP_NET_RAW to the given python binary.
-  # Returns 0 on success, 1 on failure (prints a warning).
   local pybin="$1"
-
   if [[ ! -x "$pybin" ]]; then
     echo "    - Python binary not found at $pybin (skipping setcap)."
     return 1
@@ -173,19 +183,16 @@ try_setcap_cap_net_raw() {
     echo "    - 'setcap' not available on this system; ICMP may require sudo."
     return 1
   fi
-
   if ! setcap cap_net_raw+ep "$pybin" 2>/dev/null; then
     echo "    - setcap failed (filesystem may not support file capabilities). ICMP may require sudo."
     return 1
   fi
-
   if command -v getcap >/dev/null 2>&1; then
     if ! getcap "$pybin" | grep -q 'cap_net_raw'; then
       echo "    - getcap verification did not show cap_net_raw; ICMP may still require sudo."
       return 1
     fi
   fi
-
   echo "    - cap_net_raw granted to $pybin"
   return 0
 }
@@ -195,16 +202,17 @@ main() {
   echo "== mtr-logger bootstrap (universal) =="
 
   local PM; PM="$(detect_pm)"
-  if [[ "$PM" == "none" ]]; then
-    echo "No supported package manager found. Aborting." >&2
-    exit 1
-  fi
+  [[ "$PM" != "none" ]] || { echo "No supported package manager found. Aborting." >&2; exit 1; }
   install_deps "$PM"
   start_cron_service
 
   # ---- Prompts ----
   local GIT_URL BRANCH PREFIX WRAPPER
   GIT_URL="$(ask "Git URL" "$GIT_URL_DEFAULT")"
+  if ! is_valid_git_url "$GIT_URL"; then
+    echo "WARNING: Invalid Git URL entered; falling back to default: $GIT_URL_DEFAULT"
+    GIT_URL="$GIT_URL_DEFAULT"
+  fi
   BRANCH="$(ask "Branch" "$BRANCH_DEFAULT")"
   PREFIX="$(ask "Install prefix" "$PREFIX_DEFAULT")"
   WRAPPER="$(ask "Wrapper path" "$WRAPPER_DEFAULT")"
@@ -245,6 +253,13 @@ main() {
   echo "  Minute marks:      $MINUTES"
   echo "  Window seconds:    $WINDOW_SEC"
   echo "  Duration seconds:  $DURATION (window - safety)"
+  echo
+  echo "Repo:"
+  echo "  URL:    $GIT_URL"
+  echo "  Branch: $BRANCH"
+  echo "Install:"
+  echo "  Prefix: $PREFIX"
+  echo "  Wrapper:$WRAPPER"
   echo
 
   # ---- Clone/Update ----
