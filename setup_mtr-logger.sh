@@ -4,7 +4,7 @@
 # - Installs deps, clones repo, creates venv, adds wrapper, prompts for schedule, writes cron
 # - Ensures cron is enabled/started (systemd, SysV/service, OpenRC, BusyBox crond)
 # - Tries to grant cap_net_raw to venv python; falls back gracefully if unavailable
-# - NEW: Sanitizes prompt input (strips arrow-key escape codes) and validates Git URL
+# - Sanitizes prompt input and validates Git URL (shell-safe)
 
 set -euo pipefail
 
@@ -24,21 +24,24 @@ ASCII_DEFAULT="yes"
 USE_SCREEN_DEFAULT="yes"
 
 LOGS_PER_HOUR_DEFAULT="4"  # e.g., 0,15,30,45
-SAFETY_MARGIN_DEFAULT="5"  # seconds subtracted from each window; 0 = full window
+SAFETY_MARGIN_DEFAULT="0"  # seconds subtracted from each window; 0 = full window
 # --------------------------------------------
 
 sanitize_input() {
   # Strip ANSI escape sequences and non-printables, trim spaces
-  # shellcheck disable=SC2001
   sed -E 's/\x1B\[[0-9;]*[A-Za-z]//g' \
   | tr -cd '\11\12\15\40-\176' \
   | sed -E 's/^[[:space:]]+//; s/[[:space:]]+$//'
 }
 
 is_valid_git_url() {
-  # Accept https or ssh git URLs
-  local u="${1:-}"
-  [[ "$u" =~ ^https://[A-Za-z0-9._~:/?#@!$&'()*+,;=%-]+$ ]] || [[ "$u" =~ ^git@[^:]+:[A-Za-z0-9._/-]+(\.git)?$ ]]
+  # Shell-safe heuristic instead of regex:
+  # Accept https://... or git@host:owner/repo(.git)
+  case "${1:-}" in
+    https://*) return 0 ;;
+    git@*:* )  return 0 ;;
+    *)         return 1 ;;
+  esac
 }
 
 ask() {
@@ -72,7 +75,6 @@ detect_pm() {
 install_deps() {
   local pm="$1"
   echo "[1/10] Installing system dependencies (pm: $pm)..."
-
   case "$pm" in
     apt)
       apt-get update -y
@@ -131,7 +133,9 @@ start_cron_service() {
 
   # init.d direct fallback
   for path in /etc/init.d/cron /etc/init.d/crond /etc/init.d/cronie; do
-    [[ -x "$path" ]] && "$path" start 2>/dev/null || true
+    if [[ -x "$path" ]]; then
+      "$path" start 2>/dev/null || true
+    fi
   done
 
   # BusyBox/OpenRC direct fallback
