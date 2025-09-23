@@ -26,7 +26,7 @@ ASCII_DEFAULT="yes"       # TUI: ASCII borders (less flicker)
 USE_SCREEN_DEFAULT="yes"  # TUI: alt screen
 
 LOGS_PER_HOUR_DEFAULT="4"  # e.g., 0,15,30,45
-SAFETY_MARGIN_DEFAULT="60" # seconds subtracted from each window to avoid overlap
+SAFETY_MARGIN_DEFAULT="0" # seconds subtracted from each window to avoid overlap
 # ------------------------------------------------------
 
 # TTY-safe prompt (works with curl | sudo bash)
