@@ -1,274 +1,200 @@
+# src/mtrpy/cli.py
 from __future__ import annotations
+
 import argparse
 import asyncio
-import ipaddress
-from time import perf_counter
-from pathlib import Path
-from typing import Optional, List
-from rich.live import Live
+import time
+from typing import Optional
 
-from .tracer import trace, Hop
+from .pinger import ping_host
 from .stats import Circuit
-from .render import build_table, render_table, console
+from .tracer import trace
+from .render import render_table  # ASCII-friendly table renderer
 from .export import render_report
-from .util import default_log_dir, ensure_dir, timestamp_filename
+from .util import (
+    default_log_dir,
+    ensure_dir,
+    auto_outfile_path,
+    resolve_host,
+)
 
-
-def _collapse_at_destination(hops: List[Hop], target_ip: Optional[str] = None) -> List[Hop]:
-    if not target_ip:
-        return hops
-    out: List[Hop] = []
-    for h in hops:
-        out.append(h)
-        if (getattr(h, "address", None) and h.address == target_ip) or (
-            getattr(h, "display", None) == target_ip
-        ):
-            break
-    return out
-
-
-def _looks_like_ip(s: str) -> bool:
-    try:
-        ipaddress.ip_address(s)
-        return True
-    except ValueError:
-        return False
-
+# ---------------- CLI + runtime ----------------
 
 async def mtr_loop(
     target: str,
+    *,
     interval: float = 1.0,
     max_hops: int = 30,
-    nprobes: int = 1,
-    probe_timeout: float = 2.0,
-    proto: str = "udp",
-    fps: float = 6.0,
-    ascii_mode: bool = False,
+    nprobes: int = 3,
+    timeout: float = 5.0,
+    proto: str = "icmp",
+    dns_mode: str = "auto",
+    fps: int = 6,
+    use_ascii: bool = True,
     use_screen: bool = True,
-    dns_mode: str = "auto",
-) -> Circuit:
-    started = perf_counter()
-    circuit = Circuit()
+    duration: Optional[int] = None,
+    export_path: Optional[str] = None,
+    export_order: str = "LSRABW",
+    wide: bool = False,
+) -> Optional[str]:
+    """
+    Main loop: resolve + trace once, then continuously ping each hop, updating Circuit.
+    If duration is set, run for that many seconds then export a report and return its path.
+    """
+    resolved = resolve_host(target)
+    display_target = resolved.input if dns_mode != "off" else resolved.ip
 
-    dns_names = (not _looks_like_ip(target)) if dns_mode == "auto" else (dns_mode == "on")
-
+    # initial trace
     hops = await trace(
-        target, max_hops=max_hops, nprobes=nprobes, timeout=probe_timeout, proto=proto, dns_names=dns_names
+        resolved.ip,
+        max_hops=max_hops,
+        nprobes=nprobes,
+        timeout=timeout,
+        proto=proto,
+        dns_mode=dns_mode,
     )
-    hops = _collapse_at_destination(hops)
-    for h in hops:
-        name = getattr(h, "display", None) or getattr(h, "address", None)
-        circuit.update_hop_samples(h.ttl, name, h.rtts_ms)
 
-    with Live(
-        build_table(circuit, target, started, ascii_mode=ascii_mode),
-        console=console,
-        refresh_per_second=fps,
-        screen=use_screen,
-    ) as live:
-        while True:
-            t0 = perf_counter()
-            hops = await trace(
-                target, max_hops=max_hops, nprobes=nprobes, timeout=probe_timeout, proto=proto, dns_names=dns_names
-            )
-            hops = _collapse_at_destination(hops)
-            for h in hops:
-                name = getattr(h, "display", None) or getattr(h, "address", None)
-                circuit.update_hop_samples(h.ttl, name, h.rtts_ms)
+    circuit = Circuit(hops=hops)
+    started = time.perf_counter()
 
-            live.update(build_table(circuit, target, started, ascii_mode=ascii_mode))
-            await asyncio.sleep(max(0.0, interval - (perf_counter() - t0)))
+    # If exporting only (no screen), we still do the ping loop for duration/count
+    next_frame = 0.0
+    end_time = None if duration is None else (time.perf_counter() + float(duration))
 
+    while True:
+        # ping all known hops once per cycle
+        await asyncio.gather(
+            *[ping_host(h, proto=proto, timeout=timeout) for h in circuit.hops]
+        )
 
-async def export_once(circuit: Circuit, outfile: Optional[Path], order: str, wide: bool) -> Path:
-    text = render_report(circuit, order=order, wide=wide)
-    if outfile is None or str(outfile).lower() == "auto":
-        outdir = ensure_dir(default_log_dir())
-        outfile = outdir / timestamp_filename()
-    outfile.write_text(text)
-    return outfile
+        # interactive rendering unless suppressed
+        if use_screen:
+            now = time.perf_counter()
+            if now >= next_frame:
+                # draw a frame
+                table_text = render_table(circuit, display_target, started, ascii_mode=use_ascii)
+                # We’re in plain ASCII mode; just print the frame separated by a blank line.
+                # (External TUI libs caused flicker; this is stable across SSH/VMs.)
+                print("\x1b[2J\x1b[H", end="")  # clear screen & home
+                print(table_text, end="")
+                # target ~fps frames per second
+                if fps > 0:
+                    next_frame = now + (1.0 / fps)
 
+        # duration control (used by cron/export)
+        if end_time is not None and time.perf_counter() >= end_time:
+            # finish and export if requested
+            if export_path is not None:
+                path = await export_report(circuit, display_target, export_path, order=export_order, wide=wide)
+                return path
+            return None
 
-async def run_export_session(
-    target: str,
-    count: int,
-    interval: float,
-    order: str,
-    wide: bool,
-    outfile: Optional[str],
-    max_hops: int = 30,
-    nprobes: int = 1,
-    probe_timeout: float = 2.0,
-    proto: str = "udp",
-    dns_mode: str = "auto",
-    duration: float = 0.0,
-) -> int:
-    circuit = Circuit()
-    dns_names = (not _looks_like_ip(target)) if dns_mode == "auto" else (dns_mode == "on")
+        # pacing
+        await asyncio.sleep(max(0.01, float(interval)))
 
-    if duration and duration > 0:
-        end_at = perf_counter() + duration
-        while True:
-            t0 = perf_counter()
-            hops = await trace(
-                target, max_hops=max_hops, nprobes=nprobes, timeout=probe_timeout, proto=proto, dns_names=dns_names
-            )
-            hops = _collapse_at_destination(hops)
-            for h in hops:
-                name = getattr(h, "display", None) or getattr(h, "address", None)
-                circuit.update_hop_samples(h.ttl, name, h.rtts_ms)
-            if perf_counter() >= end_at:
-                break
-            await asyncio.sleep(max(0.0, interval - (perf_counter() - t0)))
+async def export_report(
+    circuit: Circuit,
+    target_display: str,
+    outfile: str,
+    *,
+    order: str = "LSRABW",
+    wide: bool = False,
+) -> str:
+    """
+    Write a plain-text report of the current circuit state.
+    Supports outfile == 'auto' to write to the per-user log directory with timestamped name.
+    Returns the path written.
+    """
+    if outfile == "auto":
+        out_path = auto_outfile_path(default_log_dir(), prefix="mtr")
     else:
-        cycles = max(1, count)
-        for _ in range(cycles):
-            t0 = perf_counter()
-            hops = await trace(
-                target, max_hops=max_hops, nprobes=nprobes, timeout=probe_timeout, proto=proto, dns_names=dns_names
-            )
-            hops = _collapse_at_destination(hops)
-            for h in hops:
-                name = getattr(h, "display", None) or getattr(h, "address", None)
-                circuit.update_hop_samples(h.ttl, name, h.rtts_ms)
-            await asyncio.sleep(max(0.0, interval - (perf_counter() - t0)))
+        out_path = ensure_dir(default_log_dir()) / outfile if not outfile.startswith("/") else ensure_dir(
+            (ensure_dir(default_log_dir()))  # noop, just to satisfy path type
+        ) or outfile  # will be treated as absolute below
 
-    path = await export_once(circuit, Path(outfile) if outfile else None, order, wide)
-    print(str(path))
-    return 0
+        # Normalize to string path; if relative, place under default log dir
+        if not isinstance(out_path, str):
+            out_path = str(out_path)
 
+        if not out_path.startswith("/"):
+            out_path = str(ensure_dir(default_log_dir()) / outfile)
 
-async def run_with_hourly_logs(
-    target: str,
-    interval: float,
-    order: str,
-    wide: bool,
-    log_dir: Optional[str],
-    max_hops: int = 30,
-    nprobes: int = 1,
-    probe_timeout: float = 2.0,
-    proto: str = "udp",
-    dns_mode: str = "auto",
-) -> int:
-    circuit = Circuit()
-    dns_names = (not _looks_like_ip(target)) if dns_mode == "auto" else (dns_mode == "on")
+    report = render_report(circuit, order=order, wide=wide)
+    # Ensure parent exists and write
+    if isinstance(out_path, str):
+        from pathlib import Path
+        p = Path(out_path)
+    else:
+        p = out_path
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text(report)
+    return str(p)
 
-    async def sampler():
-        while True:
-            t0 = perf_counter()
-            hops = await trace(
-                target, max_hops=max_hops, nprobes=nprobes, timeout=probe_timeout, proto=proto, dns_names=dns_names
-            )
-            hops = _collapse_at_destination(hops)
-            for h in hops:
-                name = getattr(h, "display", None) or getattr(h, "address", None)
-                circuit.update_hop_samples(h.ttl, name, h.rtts_ms)
-            await asyncio.sleep(max(0.0, interval - (perf_counter() - t0)))
-
-    async def hourly_writer():
-        while True:
-            await asyncio.sleep(3600)
-            outdir = ensure_dir(Path(log_dir) if log_dir else default_log_dir())
-            path = outdir / timestamp_filename()
-            path.write_text(render_report(circuit, order=order, wide=wide))
-
-    await asyncio.gather(sampler(), hourly_writer())
-    return 0
-
-
-def main(argv: Optional[list[str]] = None) -> int:
+def build_parser() -> argparse.ArgumentParser:
     ap = argparse.ArgumentParser(
-        prog="mtr-logger",
-        description="Cross-platform MTR-style network diagnostic"
+        prog="mtrpy",
+        description="Cross-platform MTR-like tracer/pinger/logger.",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     ap.add_argument("target", help="Hostname or IP to trace")
-    ap.add_argument("--interval", "-i", type=float, default=1.0, help="Seconds between refresh / sampling loop")
-    ap.add_argument("--max-hops", "-m", type=int, default=30)
-    ap.add_argument("--probes", "-p", type=int, default=1, help="Probes per hop for each sampling cycle")
-    ap.add_argument("--timeout", "-t", type=float, default=2.0, help="Per-probe timeout (seconds)")
-    ap.add_argument(
-        "--proto",
-        choices=["udp", "icmp", "tcp"],
-        default="udp",
-        help="Probe protocol (default: udp). icmp behaves like mtr; tcp often works well without root.",
-    )
-    ap.add_argument("--fps", type=float, default=6.0, help="UI refresh rate (frames per second)")
-    ap.add_argument("--ascii", action="store_true", help="Use ASCII borders (less flicker in VMs/SSH)")
-    ap.add_argument("--no-screen", action="store_true", help="Don’t use the terminal’s alternate screen buffer")
-    ap.add_argument(
-        "--dns",
-        choices=["auto", "on", "off"],
-        default="auto",
-        help="Hostname display: auto=hostnames for domain target, numeric for IP target; on=always names; off=numeric only.",
-    )
+    ap.add_argument("--interval", "-i", type=float, default=1.0, help="Seconds between ping rounds")
+    ap.add_argument("--max-hops", type=int, default=30, help="Maximum hops to probe")
+    ap.add_argument("--probes", "-p", type=int, default=3, help="Probes per TTL during trace")
+    ap.add_argument("--timeout", type=float, default=5.0, help="Per-probe timeout seconds")
+    ap.add_argument("--proto", choices=("udp", "icmp", "tcp"), default="icmp", help="Probe protocol")
+    ap.add_argument("--fps", type=int, default=6, help="Interactive refresh rate (frames per second)")
+    ap.add_argument("--ascii", action="store_true", help="Use ASCII borders/clear; stable over SSH/VMs")
+    ap.add_argument("--no-screen", action="store_true", help="Disable interactive screen updates (batch mode)")
+    ap.add_argument("--dns", choices=("auto", "on", "off"), default="auto", help="Hop name resolution mode")
+    # logging / export controls
+    ap.add_argument("--count", type=int, default=None, help="(Deprecated) number of ping rounds (use --duration instead)")
+    ap.add_argument("--duration", type=int, default=None, help="Run for N seconds then exit (good for cron)")
+    ap.add_argument("--order", default="LSRABW", help="Export column order (L,S,R,A,B,W)")
+    ap.add_argument("--wide", action="store_true", help="Wider address column in export")
+    ap.add_argument("--export", action="store_true", help="Write a text report at the end (batch mode)")
+    ap.add_argument("--outfile", default="auto", help='Path for report; use "auto" for timestamped file in log dir')
+    ap.add_argument("--log-hourly", action="store_true", help="(Deprecated) use cron-based scheduling instead")
+    ap.add_argument("--log-dir", type=str, default=None, help="Override log directory (for export 'auto')")
+    return ap
 
-    # Export / logging
-    ap.add_argument("--count", "-c", type=int, default=0, help="Finite cycles before export (like mtr -c)")
-    ap.add_argument("--duration", type=float, default=0.0, help="Wall-clock seconds to sample before exporting (overrides --count)")
-    ap.add_argument("--order", "-o", type=str, default="LSRABW", help="Field order string, e.g., LSRABW")
-    ap.add_argument("--wide", "-w", action="store_true", help="Wide report (text table)")
-    ap.add_argument("--export", action="store_true", help="Run finite cycles and export a single report, then exit")
-    ap.add_argument("--outfile", type=str, help="Export file path; use 'auto' for timestamped in default logs dir")
-
-    # Hourly logging
-    ap.add_argument("--log-hourly", action="store_true", help="Write a snapshot report every hour")
-    ap.add_argument("--log-dir", type=str, help="Override log directory (defaults to ~/mtr/logs or %%USERPROFILE%%/mtr/logs)")
-
+def main(argv: list[str] | None = None) -> int:
+    ap = build_parser()
     args = ap.parse_args(argv)
 
+    # normalize options
+    use_screen = not args.no_screen
+    export_path: Optional[str] = None
     if args.export:
-        return asyncio.run(
-            run_export_session(
-                args.target,
-                args.count or 1,
-                args.interval,
-                args.order,
-                args.wide,
-                args.outfile,
-                max_hops=args.max_hops,
-                nprobes=args.probes,
-                probe_timeout=args.timeout,
-                proto=args.proto,
-                dns_mode=args.dns,
-                duration=args.duration,
-            )
-        )
+        if args.outfile == "auto":
+            export_path = "auto"
+        else:
+            export_path = args.outfile
 
-    if args.log_hourly:
-        return asyncio.run(
-            run_with_hourly_logs(
-                args.target,
-                args.interval,
-                args.order,
-                args.wide,
-                args.log_dir,
-                max_hops=args.max_hops,
-                nprobes=args.probes,
-                probe_timeout=args.timeout,
-                proto=args.proto,
-                dns_mode=args.dns,
-            )
-        )
-
+    # run
     try:
-        asyncio.run(
+        path = asyncio.run(
             mtr_loop(
                 args.target,
                 interval=args.interval,
                 max_hops=args.max_hops,
                 nprobes=args.probes,
-                probe_timeout=args.timeout,
+                timeout=args.timeout,
                 proto=args.proto,
-                fps=args.fps,
-                ascii_mode=args.ascii,
-                use_screen=not args.no_screen,
                 dns_mode=args.dns,
+                fps=args.fps,
+                use_ascii=args.ascii,
+                use_screen=use_screen,
+                duration=args.duration,
+                export_path=export_path,
+                export_order=args.order,
+                wide=args.wide,
             )
         )
+        if path:
+            print(path)
     except KeyboardInterrupt:
-        pass
+        return 130
     return 0
 
-
-# convenience entry
-run = main
+def run():
+    raise SystemExit(main())
