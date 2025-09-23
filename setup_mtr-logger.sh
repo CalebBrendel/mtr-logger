@@ -25,7 +25,7 @@ FPS_DEFAULT="6"           # TUI only
 ASCII_DEFAULT="yes"       # TUI: ASCII borders (less flicker)
 USE_SCREEN_DEFAULT="yes"  # TUI: alt screen
 
-LOGS_PER_HOUR_DEFAULT="4" # e.g., 0,15,30,45
+LOGS_PER_HOUR_DEFAULT="4"  # e.g., 0,15,30,45
 SAFETY_MARGIN_DEFAULT="60" # seconds subtracted from each window to avoid overlap
 # ------------------------------------------------------
 
@@ -35,7 +35,6 @@ ask() {
   if [[ -t 0 ]]; then
     read -r -p "$label [$default]: " ans
   else
-    # Read from controlling terminal if stdin isn't a TTY
     read -r -p "$label [$default]: " ans < /dev/tty
   fi
   printf "%s\n" "${ans:-$default}"
@@ -74,7 +73,7 @@ validate_factor_of_60() {
   esac
 }
 
-# FIXED: declare after assigning n to avoid "unbound variable" with set -u
+# Fixed to avoid "unbound variable" with set -u
 minutes_list() {
   local n="$1"
   local step out m
@@ -165,16 +164,14 @@ main() {
   echo "[5/8] Installing package (editable)..."
   pip install -e "$SRC_DIR"
 
-  # ---- Wrapper ----
+  # ---- Wrapper (fixed to run module directly) ----
   echo "[6/8] Creating wrapper: $WRAPPER"
   cat > "$WRAPPER" <<WRAP
 #!/usr/bin/env bash
 set -euo pipefail
 VENV="$VENV_DIR"
 source "\$VENV/bin/activate"
-# Console entrypoint is provided by the package; currently named 'mtrpy'.
-# We expose it under the friendlier 'mtr-logger' wrapper.
-exec mtrpy "\$@"
+exec "\$VENV/bin/python" -m mtrpy "\$@"
 WRAP
   chmod +x "$WRAPPER"
 
