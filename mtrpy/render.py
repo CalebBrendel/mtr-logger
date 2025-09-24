@@ -7,8 +7,6 @@ from rich.console import Console
 from rich.table import Table
 from rich import box
 
-# Exported console (cli.py imports this as `console`)
-# - simple color system so it behaves well over SSH / VMs
 console = Console(color_system="standard", force_terminal=True)
 
 HEADERS = ["Hop", "Address", "Loss%", "Snt", "Recv", "Avg", "Best", "Wrst"]
@@ -26,11 +24,6 @@ def build_table(
     ascii_mode: bool = False,
     wide: bool = False,
 ):
-    """
-    Return a Rich Table object for the current circuit snapshot.
-    - `circuit.hops` is expected to be Dict[int, HopStat]
-    - `HopStat` has: ttl, address, sent, recv, avg_ms, best_ms, worst_ms
-    """
     t = Table(
         expand=wide,
         box=box.SIMPLE if ascii_mode else box.ROUNDED,
@@ -42,13 +35,10 @@ def build_table(
         collapse_padding=True,
     )
 
-    # Column alignment
     for h in HEADERS:
         justify = "left" if h == "Address" else "right"
-        # allow wrapping only on Address to keep numeric columns aligned
         t.add_column(h, justify=justify, no_wrap=(h != "Address"))
 
-    # Rows by TTL
     for ttl in sorted(circuit.hops.keys()):
         hop = circuit.hops[ttl]
         address = hop.address or "*"
@@ -66,7 +56,6 @@ def build_table(
             _fmt_ms(hop.best_ms),
             _fmt_ms(hop.worst_ms),
         )
-
     return t
 
 
@@ -78,10 +67,6 @@ def render_table(
     ascii_mode: bool = False,
     wide: bool = False,
 ) -> str:
-    """
-    Render the table to plain text (string) using the module-level console.
-    Used by log/export paths.
-    """
     table = build_table(circuit, target, started_at, ascii_mode=ascii_mode, wide=wide)
     with console.capture() as cap:
         console.print(table)
