@@ -1,86 +1,50 @@
 from __future__ import annotations
-
 from time import perf_counter
-from typing import Optional
-
 from rich.console import Console
 from rich.table import Table
 from rich import box
 
-# Exported console (cli.py imports this as `console`)
-# - simple color system so it behaves well over SSH / VMs
+from .stats import Circuit
+
+# Global rich console used by cli.py
 console = Console(color_system="standard", force_terminal=True)
 
 HEADERS = ["Hop", "Address", "Loss%", "Snt", "Recv", "Avg", "Best", "Wrst"]
 
-
-def _fmt_ms(v: Optional[float]) -> str:
-    return f"{v:.1f}" if v is not None else "-"
-
+def _fmt(v):
+    return "-" if v is None else f"{v:.1f}"
 
 def build_table(
-    circuit,
-    target: str,
+    circuit: Circuit,
+    title: str,
     started_at: float,
-    *,
     ascii_mode: bool = False,
     wide: bool = False,
-):
-    """
-    Return a Rich Table object for the current circuit snapshot.
-    - `circuit.hops` is expected to be Dict[int, HopStat]
-    - `HopStat` has: ttl, address, sent, recv, avg_ms, best_ms, worst_ms
-    """
+) -> Table:
+    """Build a rich.Table with hop statistics."""
     t = Table(
         expand=wide,
         box=box.SIMPLE if ascii_mode else box.ROUNDED,
         show_edge=True,
         show_lines=False,
-        title=f"mtr-logger → {target}",
+        title=title,
         caption=f"{int(perf_counter() - started_at)}s — Ctrl+C to quit",
-        pad_edge=False,
-        collapse_padding=True,
     )
 
-    # Column alignment
     for h in HEADERS:
-        justify = "left" if h == "Address" else "right"
-        t.add_column(h, justify=justify, no_wrap=(h != "Address"))
+        justify = "right" if h in {"Hop", "Loss%", "Snt", "Recv", "Avg", "Best", "Wrst"} else "left"
+        t.add_column(h, justify=justify)
 
-    # Rows by TTL
-    for ttl in sorted(circuit.hops.keys()):
-        hop = circuit.hops[ttl]
-        address = hop.address or "*"
-        sent = hop.sent
-        recv = hop.recv
-        loss_pct = 0.0 if sent == 0 else (100.0 * (1.0 - (recv / sent)))
-
+    for ttl, addr, lp, snt, rcv, avg, best, wrst in circuit.rows():
         t.add_row(
-            f"{ttl}",
-            address,
-            f"{int(round(loss_pct))}",
-            f"{sent}",
-            f"{recv}",
-            _fmt_ms(hop.avg_ms),
-            _fmt_ms(hop.best_ms),
-            _fmt_ms(hop.worst_ms),
+            str(ttl),
+            (addr or "*"),
+            f"{int(round(lp, 0))}",
+            str(snt),
+            str(rcv),
+            _fmt(avg),
+            _fmt(best),
+            _fmt(wrst),
         )
 
     return t
-
-
-def render_table(
-    circuit,
-    target: str,
-    started_at: float,
-    *,
-    ascii_mode: bool = False,
-    wide: bool = False,
-) -> str:
-    """
-    Render the table to plain text (string) using the module-level console.
-    """
-    table = build_table(circuit, target, started_at, ascii_mode=ascii_mode, wide=wide)
-    with console.capture() as cap:
-        console.print(table)
-    return cap.get()
