@@ -18,7 +18,8 @@ WRAPPER_DEFAULT="/usr/local/bin/mtr-logger"
 TARGET_DEFAULT="8.8.8.8"
 PROTO_DEFAULT="icmp"
 DNS_DEFAULT="auto"
-INTERVAL_DEFAULT="0.2"
+INTERVAL_DEFAULT="0.1"    # CHANGED: was 0.2
+TIMEOUT_DEFAULT="0.2"     # NEW: probe timeout (seconds)
 PROBES_DEFAULT="3"
 FPS_DEFAULT="6"
 ASCII_DEFAULT="yes"
@@ -215,11 +216,12 @@ main() {
   PREFIX="$(ask "Install prefix" "$PREFIX_DEFAULT")"
   WRAPPER="$(ask "Wrapper path" "$WRAPPER_DEFAULT")"
 
-  local TARGET PROTO DNS_MODE INTERVAL PROBES FPS ASCII USE_SCREEN
+  local TARGET PROTO DNS_MODE INTERVAL TIMEOUT PROBES FPS ASCII USE_SCREEN
   TARGET="$(ask "Target (hostname/IP)" "$TARGET_DEFAULT")"
   PROTO="$(ask "Probe protocol (icmp|tcp|udp)" "$PROTO_DEFAULT")"
   DNS_MODE="$(ask "DNS mode (auto|on|off)" "$DNS_DEFAULT")"
   INTERVAL="$(ask "Interval seconds (-i)" "$INTERVAL_DEFAULT")"
+  TIMEOUT="$(ask "Timeout seconds (--timeout)" "$TIMEOUT_DEFAULT")"     # NEW prompt
   PROBES="$(ask "Probes per hop (-p)" "$PROBES_DEFAULT")"
   FPS="$(ask "TUI FPS (interactive only)" "$FPS_DEFAULT")"
   ASCII="$(ask "Use ASCII borders? (yes/no)" "$ASCII_DEFAULT")"
@@ -310,7 +312,7 @@ WRAP
   local SCREEN_FLAG=""; [[ "$USE_SCREEN" == "no" ]] && SCREEN_FLAG="--no-screen"
 
   local CRONLINE_LOG="${MINUTES} * * * * flock -n /var/run/mtr-logger.lock \
-$WRAPPER \"$TARGET\" --proto \"$PROTO\" --dns \"$DNS_MODE\" -i \"$INTERVAL\" -p \"$PROBES\" --duration \"$DURATION\" \
+$WRAPPER \"$TARGET\" --proto \"$PROTO\" --dns \"$DNS_MODE\" -i \"$INTERVAL\" --timeout \"$TIMEOUT\" -p \"$PROBES\" --duration \"$DURATION\" \
 --export --outfile auto >> /var/log/mtr-logger.log 2>&1"
 
   # ---- Cron: daily archiving ----
@@ -325,7 +327,7 @@ $VENV_DIR/bin/python -m mtrpy.archiver --retention $ARCHIVE_RETENTION_DEFAULT >>
 
   echo "[10/11] Self-test (non-fatal if it fails) ..."
   set +e
-  TEST_PATH="$("$WRAPPER" "$TARGET" --proto tcp --dns "$DNS_MODE" -i "$INTERVAL" -p "$PROBES" --duration 5 --export --outfile auto 2>/dev/null | tail -n1)"
+  TEST_PATH="$("$WRAPPER" "$TARGET" --proto tcp --dns "$DNS_MODE" -i "$INTERVAL" --timeout "$TIMEOUT" -p "$PROBES" --duration 5 --export --outfile auto 2>/dev/null | tail -n1)"
   set -e
   [[ -n "${TEST_PATH:-}" ]] && echo "    - Test log: $TEST_PATH" || echo "    - Self-test not conclusive."
 
@@ -335,7 +337,7 @@ $VENV_DIR/bin/python -m mtrpy.archiver --retention $ARCHIVE_RETENTION_DEFAULT >>
 ✅ Install complete.
 
 Run interactively:
-  mtr-logger $TARGET --proto $PROTO -i $INTERVAL -p $PROBES $ASCII_FLAG $SCREEN_FLAG
+  mtr-logger $TARGET --proto $PROTO -i $INTERVAL --timeout $TIMEOUT -p $PROBES $ASCII_FLAG $SCREEN_FLAG
 
 Cron (root):
   $CRONLINE_LOG
