@@ -10,5 +10,5 @@
 
 <details>
   <summary>Linux</summary>
-  Test
+  Quick one-line install: curl -fsSL https://raw.githubusercontent.com/CalebBrendel/mtr-logger/main/setup_mtr-logger.sh | sudo bash
 </details>
