@@ -1,98 +1,86 @@
 from __future__ import annotations
 
 from time import perf_counter
-from typing import Iterable, Any
+from typing import Optional
 
 from rich.console import Console
 from rich.table import Table
 from rich import box
 
-# One console for both interactive + string rendering
-# Keep colors simple for SSH / VMs
-_console = Console(color_system="standard", force_terminal=True)
+# Exported console (cli.py imports this as `console`)
+# - simple color system so it behaves well over SSH / VMs
+console = Console(color_system="standard", force_terminal=True)
 
 HEADERS = ["Hop", "Address", "Loss%", "Snt", "Recv", "Avg", "Best", "Wrst"]
 
 
-def _fmt_ms(v: float | None) -> str:
+def _fmt_ms(v: Optional[float]) -> str:
     return f"{v:.1f}" if v is not None else "-"
 
 
-def _iter_rows_compat(circuit: Any) -> Iterable[Any]:
-    """
-    Support multiple Circuit implementations:
-
-    Priority:
-      - circuit.iter_rows()
-      - circuit.as_rows()
-      - circuit.hops dict (sorted by ttl)
-    Expect row / hop fields:
-      ttl, address, loss_pct, sent, recv, avg_ms, best_ms, worst_ms
-    """
-    if hasattr(circuit, "iter_rows") and callable(circuit.iter_rows):
-        yield from circuit.iter_rows()  # new API
-        return
-    if hasattr(circuit, "as_rows") and callable(circuit.as_rows):
-        yield from circuit.as_rows()    # old API
-        return
-    # Fallback: assume dict of HopStat by ttl
-    hops = getattr(circuit, "hops", {})
-    for ttl in sorted(hops.keys()):
-        yield hops[ttl]
-
-
 def build_table(
-    circuit: Any,
-    title: str,
+    circuit,
+    target: str,
     started_at: float,
     *,
     ascii_mode: bool = False,
     wide: bool = False,
-) -> Table:
-    """Create a Rich Table for the current circuit snapshot."""
+):
+    """
+    Return a Rich Table object for the current circuit snapshot.
+    - `circuit.hops` is expected to be Dict[int, HopStat]
+    - `HopStat` has: ttl, address, sent, recv, avg_ms, best_ms, worst_ms
+    """
     t = Table(
         expand=wide,
         box=box.SIMPLE if ascii_mode else box.ROUNDED,
         show_edge=True,
         show_lines=False,
-        title=title,
+        title=f"mtr-logger → {target}",
         caption=f"{int(perf_counter() - started_at)}s — Ctrl+C to quit",
         pad_edge=False,
+        collapse_padding=True,
     )
-    # Column alignments
-    for h in HEADERS:
-        if h in {"Hop", "Loss%", "Snt", "Recv", "Avg", "Best", "Wrst"}:
-            t.add_column(h, justify="right", no_wrap=True)
-        else:
-            t.add_column(h, justify="left")
 
-    # Rows
-    for row in _iter_rows_compat(circuit):
-        ttl = getattr(row, "ttl", None)
-        addr = getattr(row, "address", None) or "*"
-        loss = getattr(row, "loss_pct", 0.0)
-        sent = getattr(row, "sent", 0)
-        recv = getattr(row, "recv", 0)
-        avg = getattr(row, "avg_ms", None)
-        best = getattr(row, "best_ms", None)
-        worst = getattr(row, "worst_ms", None)
+    # Column alignment
+    for h in HEADERS:
+        justify = "left" if h == "Address" else "right"
+        t.add_column(h, justify=justify, no_wrap=(h != "Address"))
+
+    # Rows by TTL
+    for ttl in sorted(circuit.hops.keys()):
+        hop = circuit.hops[ttl]
+        address = hop.address or "*"
+        sent = hop.sent
+        recv = hop.recv
+        loss_pct = 0.0 if sent == 0 else (100.0 * (1.0 - (recv / sent)))
 
         t.add_row(
-            str(ttl) if ttl is not None else "-",
-            str(addr),
-            f"{loss:.0f}",
-            str(sent),
-            str(recv),
-            _fmt_ms(avg),
-            _fmt_ms(best),
-            _fmt_ms(worst),
+            f"{ttl}",
+            address,
+            f"{int(round(loss_pct))}",
+            f"{sent}",
+            f"{recv}",
+            _fmt_ms(hop.avg_ms),
+            _fmt_ms(hop.best_ms),
+            _fmt_ms(hop.worst_ms),
         )
 
     return t
 
 
-def render_table(table: Table) -> str:
-    """Render a Rich Table to a string (for printing without flicker)."""
-    with _console.capture() as cap:
-        _console.print(table)
+def render_table(
+    circuit,
+    target: str,
+    started_at: float,
+    *,
+    ascii_mode: bool = False,
+    wide: bool = False,
+) -> str:
+    """
+    Render the table to plain text (string) using the module-level console.
+    """
+    table = build_table(circuit, target, started_at, ascii_mode=ascii_mode, wide=wide)
+    with console.capture() as cap:
+        console.print(table)
     return cap.get()
