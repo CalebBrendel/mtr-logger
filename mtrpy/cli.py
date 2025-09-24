@@ -17,8 +17,6 @@ from .util import (
     now_local_str,
 )
 
-# --- helpers ---------------------------------------------------------------
-
 async def mtr_loop(
     target: str,
     interval: float,
@@ -35,52 +33,64 @@ async def mtr_loop(
     Interactive loop if duration is None; otherwise run for 'duration' seconds and write a log file.
     Returns the log path in non-interactive mode; None in interactive.
     """
-    resolved = resolve_host(target, dns_mode=dns_mode)  # returns object with .ip and .display
+    resolved = resolve_host(target, dns_mode=dns_mode)  # has .ip and .display
     display_target = resolved.display
+    dest_ip = resolved.ip
     tr_path = resolve_tracer()
 
     circuit = Circuit()
     started = perf_counter()
 
-    # interactive render setup
+    # remember the first TTL that matched the destination; ignore higher TTLs afterwards
+    dest_ttl_found: Optional[int] = None
+
     from rich.live import Live
     table = build_table(circuit, display_target, started, ascii_mode=ascii_mode, wide=wide)
 
     out_path: Optional[str] = None
     end_time = None if duration is None else (perf_counter() + duration)
 
-    with Live(table, console=console, auto_refresh=False, transient=False) as live:
-        while True:
-            # stop condition for non-interactive
-            if end_time is not None and perf_counter() >= end_time:
-                break
+    try:
+        with Live(table, console=console, auto_refresh=False, transient=False) as live:
+            while True:
+                # stop condition for non-interactive
+                if end_time is not None and perf_counter() >= end_time:
+                    break
 
-            # one tracer round
-            rtts_by_ttl, addr_by_ttl, _ok = await run_tracer_round(
-                tr_path, resolved.ip, max_hops, timeout, proto, probes
-            )
+                # one tracer round
+                rtts_by_ttl, addr_by_ttl, _ok = await run_tracer_round(
+                    tr_path, resolved.ip, max_hops, timeout, proto, probes
+                )
 
-            # apply results
-            if rtts_by_ttl:
-                max_seen = max((ttl for ttl, lst in rtts_by_ttl.items() if lst), default=0)
-            else:
-                max_seen = 0
+                # if we see the destination IP, lock the path length
+                for ttl, addr in addr_by_ttl.items():
+                    if addr == dest_ip:
+                        if dest_ttl_found is None or ttl < dest_ttl_found:
+                            dest_ttl_found = ttl
 
-            for ttl in range(1, max_seen + 1):
-                samples = rtts_by_ttl.get(ttl, [])
-                addr = addr_by_ttl.get(ttl)
-                # only update when we actually have samples (stats.py counts sent only when samples exist)
-                circuit.update_hop_samples(ttl, addr, samples)
+                # decide which TTLs to apply this round:
+                # - only TTLs that produced samples (prevents phantom rows)
+                # - if dest_ttl_found, ignore any TTLs beyond it (no post-destination rows)
+                for ttl, samples in rtts_by_ttl.items():
+                    if not samples:
+                        continue
+                    if dest_ttl_found is not None and ttl > dest_ttl_found:
+                        continue
+                    addr = addr_by_ttl.get(ttl)
+                    circuit.update_hop_samples(ttl, addr, samples)
 
-            # refresh interactive table
-            table = build_table(circuit, display_target, started, ascii_mode=ascii_mode, wide=wide)
-            live.update(table, refresh=True)
+                # refresh interactive table
+                table = build_table(circuit, display_target, started, ascii_mode=ascii_mode, wide=wide)
+                live.update(table, refresh=True)
 
-            # sleep until next round (wall clock)
-            try:
-                await asyncio.sleep(interval)
-            except asyncio.CancelledError:
-                break
+                # sleep until next round (wall clock)
+                try:
+                    await asyncio.sleep(interval)
+                except asyncio.CancelledError:
+                    break
+    except KeyboardInterrupt:
+        # clean exit on Ctrl+C (no traceback)
+        pass
 
     # non-interactive export when duration was set
     if end_time is not None:
@@ -90,7 +100,6 @@ async def mtr_loop(
         ensure_dir(log_dir)
         out_path = os.path.join(log_dir, timestamp_filename(prefix="mtr", ext=".txt"))
 
-        # build report text + alerts
         lines = []
         lines.append(write_text_report(circuit))
         alerts = alert_lines_for_losses(circuit, now_local_str())
@@ -108,8 +117,6 @@ async def mtr_loop(
         os.replace(tmp_path, out_path)
 
     return out_path
-
-# --- CLI entry -------------------------------------------------------------
 
 def main(argv: Optional[list[str]] = None) -> int:
     ap = argparse.ArgumentParser(
