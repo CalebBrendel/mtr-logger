@@ -1,4 +1,5 @@
 from __future__ import annotations
+
 import asyncio
 import contextlib
 import os
@@ -6,38 +7,42 @@ import socket
 import sys
 import tempfile
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from shutil import which as _which
-from typing import Iterable, Optional, Union
+from typing import Iterable, Optional
 
 IS_WINDOWS = sys.platform.startswith("win")
 
 
-# ---------- filesystem helpers ----------
+# ---------------- Filesystem helpers ----------------
 
 def ensure_dir(p: Path) -> None:
     p.mkdir(parents=True, exist_ok=True)
 
 
 def default_log_dir() -> Path:
-    """
-    Default logs directory under ~/mtr/logs, created if missing.
-    """
     base = Path.home() / "mtr" / "logs"
     ensure_dir(base)
     return base
 
 
 def timestamp_filename(prefix: str = "mtr", ext: str = ".txt") -> str:
-    """
-    Return a filename like: mtr-09-24-2025-01-51-57.txt
-    """
+    # mtr-09-24-2025-01-51-57.txt
     ts = datetime.now().strftime("%m-%d-%Y-%H-%M-%S")
     return f"{prefix}-{ts}{ext}"
 
 
-# ---------- time formatting ----------
+def atomic_write_text(path: Path, text: str) -> None:
+    """Safely write text by using a temporary file and atomic rename."""
+    ensure_dir(path.parent)
+    with tempfile.NamedTemporaryFile("w", delete=False, dir=str(path.parent)) as tmp:
+        tmp.write(text)
+        tmp_path = Path(tmp.name)
+    tmp_path.replace(path)
+
+
+# ---------------- Time helpers ----------------
 
 def now_local_str(time_only: bool = False) -> str:
     """
@@ -48,46 +53,16 @@ def now_local_str(time_only: bool = False) -> str:
     now = datetime.now()
     if time_only:
         s = now.strftime("%I:%M:%S%p")
-        return s.lstrip("0")  # drop leading zero from hour
+        return s.lstrip("0")
     return f"{now.strftime('%m-%d-%Y')} {now.strftime('%I:%M:%S%p').lstrip('0')}"
 
 
-# ---------- atomic file write ----------
-
-def atomic_write_text(path: Union[str, Path], text: str) -> None:
-    """
-    Atomically write text to a file:
-      1) write to temp file in the same directory
-      2) fsync
-      3) os.replace to final path
-    Safe against partial writes if the system crashes mid-write.
-    """
-    path = Path(path)
-    ensure_dir(path.parent)
-    fd, tmppath = tempfile.mkstemp(prefix=".tmp", dir=str(path.parent))
-    try:
-        with os.fdopen(fd, "w", encoding="utf-8") as f:
-            f.write(text)
-            f.flush()
-            os.fsync(f.fileno())
-        os.replace(tmppath, str(path))
-    finally:
-        with contextlib.suppress(FileNotFoundError):
-            if os.path.exists(tmppath):
-                os.unlink(tmppath)
-
-
-# ---------- process helpers ----------
+# ---------------- Process / system helpers ----------------
 
 async def run_proc(*args: str, timeout: Optional[float] = None) -> tuple[bytes, bytes, int]:
-    """
-    Run a subprocess, capture stdout/stderr, with optional timeout.
-    Returns (stdout_bytes, stderr_bytes, returncode).
-    """
+    """Run a subprocess, capture stdout/stderr, with optional timeout."""
     proc = await asyncio.create_subprocess_exec(
-        *args,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
+        *args, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
     )
     try:
         out_b, err_b = await asyncio.wait_for(proc.communicate(), timeout=timeout)
@@ -108,26 +83,32 @@ def which(candidates: Iterable[str] | str) -> Optional[str]:
     return None
 
 
-# ---------- DNS/host resolution ----------
+# ---------------- DNS helpers ----------------
+
+def is_ip_literal(s: str) -> bool:
+    try:
+        socket.inet_pton(socket.AF_INET, s)
+        return True
+    except OSError:
+        pass
+    with contextlib.suppress(OSError, ValueError):
+        socket.inet_pton(socket.AF_INET6, s)
+        return True
+    return False
+
 
 @dataclass
 class ResolvedHost:
-    ip: str        # IPv4/IPv6 numeric
-    display: str   # what to show in UI/title (hostname if given, else ip)
+    ip: str        # numeric IP for probing
+    display: str   # what to show as target title
 
 
 def resolve_host(target: str, dns_mode: str = "auto") -> ResolvedHost:
-    """
-    Resolve to a numeric IP for probing, and decide display string.
-    dns_mode:
-      - 'off': never do reverse names here (display is the ip)
-      - 'on' : prefer names for display when available (handled later in CLI)
-      - 'auto': keep given hostname for display if it isn't a numeric IP
-    """
+    """Resolve forward to an IP, and decide display string."""
     ip = None
     try:
         infos = socket.getaddrinfo(target, None)
-        # prefer IPv4 over IPv6 if available
+        # prefer IPv4
         infos_sorted = sorted(infos, key=lambda x: 0 if x[0] == socket.AF_INET else 1)
         for family, _type, _proto, _canon, sockaddr in infos_sorted:
             if family in (socket.AF_INET, socket.AF_INET6):
@@ -139,11 +120,44 @@ def resolve_host(target: str, dns_mode: str = "auto") -> ResolvedHost:
     if ip is None:
         ip = target
 
-    # decide display
+    # display
     if dns_mode == "off":
-        disp = ip
-    else:
-        # keep original hostname if it isn't an IP literal
-        disp = target if any(ch.isalpha() for ch in target) else ip
+        display = ip
+    elif dns_mode == "on":
+        display = target if not is_ip_literal(target) else ip
+    else:  # auto
+        display = target if not is_ip_literal(target) else ip
 
-    return ResolvedHost(ip=ip, display=disp)
+    return ResolvedHost(ip=ip, display=display)
+
+
+class ReverseDNSCache:
+    """Very small async reverse-DNS cache to avoid blocking UI too long."""
+    def __init__(self) -> None:
+        self.cache: dict[str, str] = {}  # ip -> name
+        self.pending: set[str] = set()
+
+    async def lookup(self, ip: Optional[str]) -> Optional[str]:
+        if not ip or is_ip_literal(ip) is False:
+            return ip
+        if ip in self.cache:
+            return self.cache[ip]
+        if ip in self.pending:
+            return ip  # return ip until finished
+
+        loop = asyncio.get_running_loop()
+        self.pending.add(ip)
+
+        def _do():
+            try:
+                name, _alias, _addrs = socket.gethostbyaddr(ip)
+                return name
+            except Exception:
+                return None
+
+        name = await loop.run_in_executor(None, _do)
+        self.pending.discard(ip)
+        if name:
+            self.cache[ip] = name
+            return name
+        return ip  # fallback to ip if no PTR
