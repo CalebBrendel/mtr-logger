@@ -41,7 +41,7 @@ async def mtr_loop(
     circuit = Circuit()
     started = perf_counter()
 
-    # remember the first TTL that matched the destination; ignore higher TTLs afterwards
+    # first TTL at which we saw the destination; ignore > this TTL
     dest_ttl_found: Optional[int] = None
 
     from rich.live import Live
@@ -53,43 +53,38 @@ async def mtr_loop(
     try:
         with Live(table, console=console, auto_refresh=False, transient=False) as live:
             while True:
-                # stop condition for non-interactive
                 if end_time is not None and perf_counter() >= end_time:
                     break
 
-                # one tracer round
-                rtts_by_ttl, addr_by_ttl, _ok = await run_tracer_round(
-                    tr_path, resolved.ip, max_hops, timeout, proto, probes
-                )
+                try:
+                    rtts_by_ttl, addr_by_ttl, _ok = await run_tracer_round(
+                        tr_path, resolved.ip, max_hops, timeout, proto, probes
+                    )
+                except (asyncio.CancelledError, KeyboardInterrupt):
+                    break
 
-                # if we see the destination IP, lock the path length
+                # lock on the first TTL that equals the destination IP
                 for ttl, addr in addr_by_ttl.items():
                     if addr == dest_ip:
                         if dest_ttl_found is None or ttl < dest_ttl_found:
                             dest_ttl_found = ttl
 
-                # decide which TTLs to apply this round:
-                # - only TTLs that produced samples (prevents phantom rows)
-                # - if dest_ttl_found, ignore any TTLs beyond it (no post-destination rows)
+                # apply only TTLs that appeared; count ALL probes attempted (even if 0 replies)
                 for ttl, samples in rtts_by_ttl.items():
-                    if not samples:
-                        continue
                     if dest_ttl_found is not None and ttl > dest_ttl_found:
                         continue
                     addr = addr_by_ttl.get(ttl)
-                    circuit.update_hop_samples(ttl, addr, samples)
+                    circuit.update_hop_round(ttl, addr, probes, samples)
 
                 # refresh interactive table
                 table = build_table(circuit, display_target, started, ascii_mode=ascii_mode, wide=wide)
                 live.update(table, refresh=True)
 
-                # sleep until next round (wall clock)
                 try:
                     await asyncio.sleep(interval)
                 except asyncio.CancelledError:
                     break
     except KeyboardInterrupt:
-        # clean exit on Ctrl+C (no traceback)
         pass
 
     # non-interactive export when duration was set
@@ -137,14 +132,10 @@ def main(argv: Optional[list[str]] = None) -> int:
     ap.add_argument("--duration", type=int, help="Run non-interactive for N seconds and export a log")
     ap.add_argument("--order", choices=("ttl", "loss", "avg"), default="ttl")
     ap.add_argument("--wide", action="store_true", help="Wider table layout")
-    ap.add_argument("--export", action="store_true", help="(kept for compatibility) — no-op; logs are written if --duration used")
-    ap.add_argument("--outfile", default="auto", help="(kept for compatibility)")
+    ap.add_argument("--export", action="store_true", help="(compat) no-op; logs written when --duration is set")
+    ap.add_argument("--outfile", default="auto", help="(compat) ignored")
 
     args = ap.parse_args(argv)
-
-    use_ascii = bool(args.ascii)
-    wide = bool(args.wide)
-    duration = args.duration
 
     out_path = asyncio.run(
         mtr_loop(
@@ -154,13 +145,12 @@ def main(argv: Optional[list[str]] = None) -> int:
             probes=args.probes,
             timeout=args.timeout,
             proto=args.proto,
-            ascii_mode=use_ascii,
-            wide=wide,
-            duration=duration,
+            ascii_mode=bool(args.ascii),
+            wide=bool(args.wide),
+            duration=args.duration,
             dns_mode=args.dns,
         )
     )
-
     if out_path:
         print(out_path)
     return 0
