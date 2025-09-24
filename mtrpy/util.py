@@ -1,83 +1,108 @@
 from __future__ import annotations
+
 import os
+import shutil
 import socket
 from dataclasses import dataclass
-from typing import Optional
+from datetime import datetime
+from pathlib import Path
+from typing import Iterable, Optional
 
-IS_WINDOWS = (os.name == "nt")
+# -------- Platform helpers --------
+IS_WINDOWS = os.name == "nt"
 
 
-def ensure_dir(path: str) -> None:
-    os.makedirs(path, exist_ok=True)
+# -------- Filesystem helpers --------
+def home_dir() -> Path:
+    """Cross-platform home dir (Linux: /home/$USER, Windows: %USERPROFILE%)."""
+    return Path(os.path.expanduser("~")).resolve()
 
 
-def default_log_dir() -> str:
-    # Linux/mac: ~/mtr/logs ; Windows: %USERPROFILE%\mtr\logs
-    home = os.path.expanduser("~")
-    base = os.path.join(home, "mtr", "logs")
-    ensure_dir(base)
-    return base
+def default_log_dir() -> Path:
+    """
+    Default log directory:
+      - Linux/macOS:  ~/mtr/logs
+      - Windows:      %USERPROFILE%\\mtr\\logs
+    """
+    root = home_dir() / "mtr" / "logs"
+    return root
+
+
+def ensure_dir(p: Path) -> Path:
+    """Create directory if needed and return it."""
+    p.mkdir(parents=True, exist_ok=True)
+    return p
 
 
 def timestamp_filename(prefix: str = "mtr", ext: str = ".txt") -> str:
-    # mtr-MM-DD-YYYY-HH-MM-SS.txt
-    from datetime import datetime
-    stamp = datetime.now().strftime("%m-%d-%Y-%H-%M-%S")
-    return f"{prefix}-{stamp}{ext}"
+    """mtr-09-24-2025-01-02-03.txt"""
+    ts = datetime.now().strftime("%m-%d-%Y-%H-%M-%S")
+    return f"{prefix}-{ts}{ext}"
 
 
-@dataclass
-class Resolved:
-    name: str
-    ip: str
-    display: str
+def now_local_str() -> str:
+    """Current local time as HH:MM:SSAM/PM (no date)."""
+    return datetime.now().strftime("%I:%M:%S%p").lstrip("0")
 
 
-async def resolve_host(target: str, mode: str = "auto") -> Resolved:
+# -------- Process / PATH helpers --------
+def which(candidates: Iterable[str]) -> Optional[str]:
     """
-    mode: auto|on|off
-      - auto: show hostnames if initial target is hostname else show IPs
-      - on: always reverse resolve
-      - off: never reverse resolve
+    Find the first executable on PATH from a list of names.
+    Returns absolute path or None.
     """
-    try:
-        # resolve A/AAAA
-        ai = socket.getaddrinfo(target, None, proto=socket.IPPROTO_TCP)
-        ip = ai[0][4][0]
-    except Exception:
-        # maybe already an IP
-        ip = target
-
-    # decide display target
-    if mode == "off":
-        display = ip
-        name = target
-    elif mode == "on":
-        try:
-            name = socket.gethostbyaddr(ip)[0]
-        except Exception:
-            name = ip
-        display = name
-    else:  # auto
-        # if user typed a hostname (contains letters), keep name; else IP
-        is_name = any(c.isalpha() for c in target)
-        if is_name:
-            display = target
-            name = target
-        else:
-            display = ip
-            name = target
-
-    return Resolved(name=name, ip=ip, display=display)
-
-
-def which(cmds) -> Optional[str]:
-    if isinstance(cmds, str):
-        cmds = [cmds]
-    paths = os.environ.get("PATH", "").split(os.pathsep)
-    for c in cmds:
-        for d in paths:
-            p = os.path.join(d, c)
-            if os.path.isfile(p) and os.access(p, os.X_OK):
-                return p
+    for name in candidates:
+        path = shutil.which(name)
+        if path:
+            return path
     return None
+
+
+# -------- DNS / target helpers --------
+@dataclass
+class ResolvedTarget:
+    ip: str        # numeric IP we will probe (IPv4 preferred)
+    display: str   # how to display the target in UI/headers
+
+
+def _first_ipv4(host: str) -> Optional[str]:
+    """Best-effort IPv4 selection for traceroute compatibility."""
+    try:
+        infos = socket.getaddrinfo(host, None, socket.AF_INET, socket.SOCK_STREAM)
+        for family, _stype, _proto, _canon, sockaddr in infos:
+            if family == socket.AF_INET:
+                return sockaddr[0]
+    except socket.gaierror:
+        return None
+    return None
+
+
+def resolve_host(target: str, dns_mode: str = "auto") -> ResolvedTarget:
+    """
+    Resolve the target into an IP we can pass to traceroute/tcptraceroute.
+    - If target is already a dotted quad, use it.
+    - Otherwise prefer IPv4 from DNS.
+    - display:
+        * if user passed a hostname, show that
+        * if user passed an IP, show that IP
+    """
+    # Already IPv4?
+    try:
+        socket.inet_aton(target)
+        return ResolvedTarget(ip=target, display=target)
+    except OSError:
+        pass
+
+    ip = _first_ipv4(target)
+    if not ip:
+        # Last resort: try generic resolution (any family), use first address text
+        try:
+            infos = socket.getaddrinfo(target, None)
+            if infos:
+                ip = infos[0][4][0]
+        except socket.gaierror as _e:
+            ip = target  # allow downstream to fail with clearer message
+
+    # Show the hostname the user typed if it looked like one, else the IP
+    display = target if any(c.isalpha() for c in target) else ip
+    return ResolvedTarget(ip=ip, display=display)
