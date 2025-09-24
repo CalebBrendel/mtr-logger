@@ -1,63 +1,57 @@
 from __future__ import annotations
-
+import os
+from typing import List
 from datetime import datetime
-from typing import List, Tuple
 
 from .stats import Circuit, HopStat
+from .util import default_log_dir, ensure_dir, timestamp_filename
 
-HEADERS = ["Hop", "Address", "Loss%", "Snt", "Recv", "Avg", "Best", "Wrst"]
 
-def _fmt_ms(v):
-    return f"{v:.1f}" if v is not None else "-"
+def _fmt(v):
+    return "-" if v is None else f"{v:.1f}"
 
-def _rows(circuit: Circuit) -> List[Tuple[str, ...]]:
-    out: List[Tuple[str, ...]] = []
+
+def _row(h: HopStat) -> str:
+    return f"{h.ttl:>3}  {(h.address or '*'):<42}  {h.loss_pct:>5.0f}  {h.sent:>4}  {h.recv:>4}  {_fmt(h.avg_ms):>4}  {_fmt(h.best_ms):>4}  {_fmt(h.worst_ms):>5}"
+
+
+def export_report(circuit: Circuit, target: str, outfile: str | None, order: str = "hop", wide: bool = False) -> str:
+    # path prep
+    if outfile in (None, "", "auto"):
+        outdir = default_log_dir()
+        ensure_dir(outdir)
+        path = os.path.join(outdir, timestamp_filename("mtr"))
+    else:
+        path = outfile
+        ensure_dir(os.path.dirname(os.path.abspath(path)))
+
+    # build body
+    lines: List[str] = []
+    lines.append(" Hop  Address                                     Loss%   Snt  Recv   Avg  Best   Wrst")
+    lines.append(" ---  ------------------------------------------  -----  ----  ----  ----  ----  -----")
+
+    # stable order by ttl
     for ttl in sorted(circuit.hops.keys()):
-        hs: HopStat = circuit.hops[ttl]
-        loss = 0.0 if hs.sent == 0 else (100.0 * (1.0 - (hs.recv / hs.sent)))
-        out.append((
-            str(ttl),
-            hs.address or "*",
-            f"{loss:.0f}",
-            str(hs.sent),
-            str(hs.recv),
-            _fmt_ms(hs.avg_ms),
-            _fmt_ms(hs.best_ms),
-            _fmt_ms(hs.worst_ms),
-        ))
-    return out
+        hs = circuit.hops[ttl]
+        lines.append(_row(hs))
 
-def render_report(circuit: Circuit, *, order: str = "LSRABW", wide: bool = False) -> str:
-    # fixed-width plain text table, then alerts
-    rows = _rows(circuit)
-    cols = list(zip(*([tuple(HEADERS)] + rows))) if rows else [tuple(HEADERS)]
-    widths = [max(len(x) for x in col) for col in cols]
-    if wide:
-        widths[1] = max(widths[1], 40)
-
-    def cell(i, text):
-        just = ">" if i in (0,2,3,4,5,6,7) else "<"
-        w = widths[i]
-        return f"{text: {just}{w}}"
-
-    header = " " + "  ".join(cell(i, h) for i, h in enumerate(HEADERS)) + "\n"
-    sep = " " + "  ".join("-" * widths[i] for i in range(len(HEADERS))) + "\n"
-    body = ""
-    for r in rows:
-        body += " " + "  ".join(cell(i, r[i]) for i in range(len(HEADERS))) + "\n"
-
-    # alerts: ignore unresolved '*' hops; 12h time; include exact lost count
+    # alerts (ignore '*' hop)
     alerts: List[str] = []
     tstr = datetime.now().strftime("%I:%M:%S%p").lstrip("0")
     for ttl in sorted(circuit.hops.keys()):
-        hs: HopStat = circuit.hops[ttl]
+        hs = circuit.hops[ttl]
         if hs.address in (None, "*"):
             continue
         lost = max(0, hs.sent - hs.recv)
         if lost > 0:
             alerts.append(f"❌ Packet loss detected on hop {ttl} at {tstr} - {lost} packets were lost")
 
-    out = header + sep + body
     if alerts:
-        out += "\nAlerts:\n" + "\n".join(alerts) + "\n"
-    return out
+        lines.append("")
+        lines.append("Alerts:")
+        lines.extend(alerts)
+
+    with open(path, "w", encoding="utf-8") as f:
+        f.write("\n".join(lines) + "\n")
+
+    return path
