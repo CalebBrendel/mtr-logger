@@ -1,38 +1,50 @@
 from __future__ import annotations
 from time import perf_counter
-from typing import Iterable
+from rich.console import Console
 from rich.table import Table
 from rich import box
-from rich.console import Console
 
-from .stats import Circuit, HopStat
+from .stats import Circuit
 
-console = Console(color_system="standard", force_terminal=True)
+# One console for rendering to string (record/capture mode).
+_console = Console(color_system="standard", force_terminal=True, record=True)
 
 HEADERS = ["Hop", "Address", "Loss%", "Snt", "Recv", "Avg", "Best", "Wrst"]
-
 
 def _fmt_ms(v):
     return f"{v:.1f}" if v is not None else "-"
 
+def _box(ascii_mode: bool):
+    # SIMPLE works well over SSH/VMs; ROUNDED looks nice locally.
+    return box.SIMPLE if ascii_mode else box.ROUNDED
 
-def build_table(circuit: Circuit, target: str, started_at: float, ascii_mode: bool = False, wide: bool = False):
+def render_table(
+    circuit: Circuit,
+    target: str,
+    started_at: float,
+    ascii_mode: bool = False,
+    wide: bool = False,
+) -> str:
+    """
+    Build the Rich table then render it to a plain string for callers.
+    """
     t = Table(
-        expand=wide,
-        box=box.SIMPLE if ascii_mode else box.ROUNDED,
+        expand=False,
+        box=_box(ascii_mode),
         show_edge=True,
         show_lines=False,
         title=f"mtr-logger → {target}",
         caption=f"{int(perf_counter() - started_at)}s — Ctrl+C to quit",
+        pad_edge=False,
     )
+
+    # Column alignment
     for h in HEADERS:
-        t.add_column(h, justify="right" if h in {"Hop", "Loss%", "Snt", "Recv", "Avg", "Best", "Wrst"} else "left")
+        justify = "right" if h in {"Hop", "Loss%", "Snt", "Recv", "Avg", "Best", "Wrst"} else "left"
+        t.add_column(h, justify=justify, no_wrap=(h != "Address"))
 
-    def rows() -> Iterable[HopStat]:
-        for ttl in sorted(circuit.hops.keys()):
-            yield circuit.hops[ttl]
-
-    for row in rows():
+    # Rows
+    for row in circuit.as_rows():
         t.add_row(
             str(row.ttl),
             row.address or "*",
@@ -43,9 +55,8 @@ def build_table(circuit: Circuit, target: str, started_at: float, ascii_mode: bo
             _fmt_ms(row.best_ms),
             _fmt_ms(row.worst_ms),
         )
-    return t
 
-
-def render_table(circuit: Circuit, target: str, started_at: float, ascii_mode: bool = False, wide: bool = False) -> str:
-    table = build_table(circuit, target, started_at, ascii_mode=ascii_mode, wide=wide)
-    return console.render_str(table)
+    # Render to a plain string
+    with _console.capture() as cap:
+        _console.print(t)
+    return cap.get()
