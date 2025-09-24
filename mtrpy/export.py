@@ -1,157 +1,104 @@
 from __future__ import annotations
-
 from pathlib import Path
-from typing import Iterable, List
+from typing import Iterable, Optional, List
 
 from .stats import Circuit, HopStat
+from .util import ensure_dir, now_local_str
 
 
-# ---------- formatting helpers ----------
-
+# Fixed-width columns to match your previous logs
 HEADERS = ("Hop", "Address", "Loss%", "Snt", "Recv", "Avg", "Best", "Wrst")
-
-# column widths tuned to match your existing logs
-W = {
-    "hop": 3,
-    "addr": 42,
-    "loss": 5,
-    "snt": 4,
-    "recv": 4,
-    "avg": 4,
-    "best": 4,
-    "wrst": 5,
-}
+COLS = (4, 42, 7, 5, 5, 6, 6, 6)  # widths per column (kept consistent)
 
 
-def _fmt_ms(v: float | None) -> str:
+def _fmt_ms(v: Optional[float]) -> str:
     return "-" if v is None else f"{v:.1f}"
 
 
-def _fmt_addr(addr: str | None) -> str:
+def _fmt_addr(addr: Optional[str]) -> str:
     return "*" if not addr else addr
 
 
-def _rows(circuit: Circuit) -> Iterable[HopStat]:
-    # circuit.hops: Dict[int, HopStat]
-    for ttl in sorted(circuit.hops.keys()):
-        yield circuit.hops[ttl]
-
-
-def _table_text(circuit: Circuit) -> str:
-    # header
-    line1 = (
-        f"{HEADERS[0]:>{W['hop']}}  "
-        f"{HEADERS[1]:<{W['addr']}}  "
-        f"{HEADERS[2]:>{W['loss']}}  "
-        f"{HEADERS[3]:>{W['snt']}}  "
-        f"{HEADERS[4]:>{W['recv']}}  "
-        f"{HEADERS[5]:>{W['avg']}}  "
-        f"{HEADERS[6]:>{W['best']}}  "
-        f"{HEADERS[7]:>{W['wrst']}}"
+def _row_line(hop: HopStat) -> str:
+    cells = (
+        f"{hop.ttl:>3}",
+        f"{_fmt_addr(hop.address):<42}",
+        f"{hop.loss_pct:>5.0f}",
+        f"{hop.sent:>5}",
+        f"{hop.recv:>5}",
+        f"{_fmt_ms(hop.avg_ms):>6}",
+        f"{_fmt_ms(hop.best_ms):>6}",
+        f"{_fmt_ms(hop.worst_ms):>6}",
     )
+    return f" {cells[0]:>3}  {cells[1]:<42}  {cells[2]:>5}  {cells[3]:>3}  {cells[4]:>4}  {cells[5]:>4}  {cells[6]:>4}  {cells[7]:>5}"
 
-    line2 = (
-        f"{'-'*W['hop']:>{W['hop']}}  "
-        f"{'-'*W['addr']:<{W['addr']}}  "
-        f"{'-'*W['loss']:>{W['loss']}}  "
-        f"{'-'*W['snt']:>{W['snt']}}  "
-        f"{'-'*W['recv']:>{W['recv']}}  "
-        f"{'-'*W['avg']:>{W['avg']}}  "
-        f"{'-'*W['best']:>{W['best']}}  "
-        f"{'-'*W['wrst']:>{W['wrst']}}"
+
+def _header_line() -> str:
+    cells = (
+        f"{HEADERS[0]:>3}",
+        f"{HEADERS[1]:<42}",
+        f"{HEADERS[2]:>5}",
+        f"{HEADERS[3]:>3}",
+        f"{HEADERS[4]:>4}",
+        f"{HEADERS[5]:>4}",
+        f"{HEADERS[6]:>4}",
+        f"{HEADERS[7]:>5}",
     )
-
-    body_lines: List[str] = []
-    for hop in _rows(circuit):
-        body_lines.append(
-            f"{hop.ttl:>{W['hop']}}  "
-            f"{_fmt_addr(hop.address):<{W['addr']}}  "
-            f"{int(round(hop.loss_pct)):>{W['loss']}}  "
-            f"{hop.sent:>{W['snt']}}  "
-            f"{hop.recv:>{W['recv']}}  "
-            f"{_fmt_ms(hop.avg_ms):>{W['avg']}}  "
-            f"{_fmt_ms(hop.best_ms):>{W['best']}}  "
-            f"{_fmt_ms(hop.worst_ms):>{W['wrst']}}"
-        )
-
-    return "\n".join([line1, line2, *body_lines])
+    return f" {cells[0]:>3}  {cells[1]:<42}  {cells[2]:>5}  {cells[3]:>3}  {cells[4]:>4}  {cells[5]:>4}  {cells[6]:>4}  {cells[7]:>5}"
 
 
-# ---------- alert helpers ----------
+def _rule_line() -> str:
+    # A separator line sized to the header
+    return " ---  " + "-" * 42 + "  -----  ---  ----  ----  ----  -----"
 
-def _loss_alert_lines(
-    circuit: Circuit,
-    *,
-    ignore_unroutable: bool = True,
-) -> List[str]:
-    """Create 12-hour time alert lines for any hop with loss>0 during the run.
-    NOTE: we do not add the timestamp here; cli.py typically adds the time for interactive alerts,
-    while for exports we make one line per hop at the *end* using the final totals.
-    """
-    # We only need (ttl, lost) and whether to ignore '*'
+
+def build_text_table(circuit: Circuit) -> List[str]:
+    """Return a list of text lines representing the current table snapshot."""
     lines: List[str] = []
-    for hop in _rows(circuit):
-        addr = hop.address or "*"
-        if ignore_unroutable and addr == "*":
-            continue
-        lost = hop.sent - hop.recv
-        if lost > 0:
-            # time stamp is appended by caller (cli) when desired; for export we keep the shorter format
-            # but if cli passes a formatted time string, we’ll include it.
-            # To keep backward compatibility, we just output without time here; cli can prepend it.
-            lines.append((hop.ttl, lost))
-    # convert to human lines later (we keep ttl,lost for flexibility)
-    return [f"❌ Packet loss detected on hop {ttl} - {lost} packets were lost" for (ttl, lost) in lines]
+    lines.append(_header_line())
+    lines.append(_rule_line())
+
+    for ttl in sorted(circuit.hops.keys()):
+        hop = circuit.hops[ttl]
+        lines.append(_row_line(hop))
+
+    return lines
 
 
-# ---------- public API ----------
-
-def write_text_report(
-    circuit: Circuit,
-    target_display: str,
-    outfile_path: Path | str,
-    *,
-    append_alerts: bool = True,
-    ignore_unroutable: bool = True,
-    header_title: str | None = None,
-) -> Path:
+class IncrementalReport:
     """
-    Write a plain-text report to 'outfile_path'.
-
-    Parameters
-    ----------
-    circuit : Circuit
-        Accumulated hop stats.
-    target_display : str
-        What to show in the title line (e.g. 'google.ca' or '8.8.8.8').
-    outfile_path : Path | str
-        Destination file path. Parent directories will be created.
-    append_alerts : bool
-        If True, append an 'Alerts:' section with one line per hop that had loss.
-    ignore_unroutable : bool
-        Skip hops whose address is '*' in the alerts section.
-    header_title : Optional[str]
-        If provided, use this instead of the default title line.
+    Opens the log file once and appends a timestamped snapshot after each round,
+    plus any alerts observed in that round. Safe to tail in real time.
     """
-    path = Path(outfile_path)
-    path.parent.mkdir(parents=True, exist_ok=True)
 
-    title = header_title or f" mtr-logger → {target_display} "
-    # build text
-    header = title.rstrip()
-    table = _table_text(circuit)
+    def __init__(self, path: Path, target: str):
+        ensure_dir(path.parent)
+        self.path = path
+        self._fp = path.open("a", encoding="utf-8")
+        self._write_title(target)
 
-    lines = [table]
-    if append_alerts:
-        alerts = _loss_alert_lines(circuit, ignore_unroutable=ignore_unroutable)
-        lines.append("")
-        lines.append("Alerts:")
-        if alerts:
-            lines.extend(alerts)
-        else:
-            lines.append("None")
+    def _write_title(self, target: str) -> None:
+        self._fp.write(f"=== mtr-logger → {target} ===\n")
+        self._fp.flush()
 
-    content = f"{header}\n\n{'\n'.join(lines)}\n"
+    def append_snapshot(self, circuit: Circuit, when_str: Optional[str] = None) -> None:
+        ts = when_str or now_local_str(time_only=True)
+        self._fp.write(f"\nSnapshot @ {ts}\n")
+        for line in build_text_table(circuit):
+            self._fp.write(line + "\n")
+        self._fp.flush()
 
-    path.write_text(content, encoding="utf-8")
-    return path
+    def append_alerts(self, alerts: Iterable[str]) -> None:
+        alerts = list(alerts)
+        if not alerts:
+            return
+        self._fp.write("\nAlerts:\n")
+        for line in alerts:
+            self._fp.write(line + "\n")
+        self._fp.flush()
+
+    def close(self) -> None:
+        try:
+            self._fp.flush()
+        finally:
+            self._fp.close()
