@@ -1,61 +1,53 @@
 from __future__ import annotations
-import os
+
 import shutil
 from datetime import datetime, timedelta
+from pathlib import Path
+from typing import Optional
 
 from .util import default_log_dir, ensure_dir
 
 
-def archive_root() -> str:
-    root = os.path.join(default_log_dir(), "archive")
-    ensure_dir(root)
-    return root
+def archive_logs(retention: int = 90) -> None:
+    log_root = default_log_dir()
+    today = datetime.now().strftime("%m-%d-%Y")
+    archive_dir = log_root / "archive" / today
+    ensure_dir(archive_dir)
 
+    # Move today's loose logs (if any) into today's archive folder
+    for p in sorted(log_root.glob("mtr-*.txt")):
+        # skip existing archive folders
+        if p.is_file():
+            dest = archive_dir / p.name
+            try:
+                p.replace(dest)
+            except Exception:
+                # fallback copy+remove
+                shutil.copy2(p, dest)
+                p.unlink(missing_ok=True)
 
-def move_logs_to_archive(day_folder: str | None = None) -> str:
-    today = datetime.now().strftime("%m-%d-%Y") if day_folder is None else day_folder
-    src_dir = default_log_dir()
-    dst_dir = os.path.join(archive_root(), today)
-    ensure_dir(dst_dir)
-
-    for name in os.listdir(src_dir):
-        if not name.lower().endswith(".txt"):
+    # Prune old archive dirs
+    cutoff = datetime.now() - timedelta(days=retention)
+    for d in (log_root / "archive").glob("*"):
+        if not d.is_dir():
             continue
-        src = os.path.join(src_dir, name)
-        if not os.path.isfile(src):
-            continue
-        dst = os.path.join(dst_dir, name)
         try:
-            shutil.move(src, dst)
+            dt = datetime.strptime(d.name, "%m-%d-%Y")
         except Exception:
-            pass
-    return dst_dir
-
-
-def delete_old_archives(retention_days: int = 90) -> None:
-    root = archive_root()
-    now = datetime.now()
-    for name in os.listdir(root):
-        p = os.path.join(root, name)
-        if not os.path.isdir(p):
             continue
-        try:
-            dt = datetime.strptime(name, "%m-%d-%Y")
-        except ValueError:
-            continue
-        if (now - dt) > timedelta(days=retention_days):
-            shutil.rmtree(p, ignore_errors=True)
+        if dt < cutoff:
+            shutil.rmtree(d, ignore_errors=True)
 
 
-def main(argv=None):
+def main(argv: Optional[list[str]] = None) -> int:
+    # Allow: python -m mtrpy.archiver --retention 120
     import argparse
-    ap = argparse.ArgumentParser(description="mtr-logger archiver")
-    ap.add_argument("--retention", type=int, default=90, help="Days to retain archived folders")
-    args = ap.parse_args(argv)
-    d = move_logs_to_archive()
-    delete_old_archives(args.retention)
-    print(d)
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--retention", type=int, default=90)
+    a = ap.parse_args(argv)
+    archive_logs(a.retention)
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())
