@@ -81,8 +81,18 @@ async def run_tracer_round(
     proc = await asyncio.create_subprocess_exec(
         *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
     )
-    out_b, err_b = await proc.communicate()
+    try:
+        out_b, err_b = await proc.communicate()
+    except asyncio.CancelledError:
+        # if the loop is interrupted (Ctrl+C), stop the subprocess cleanly
+        with contextlib.suppress(Exception):
+            proc.kill()
+            await proc.wait()
+        raise
     stdout = out_b.decode(errors="replace")
     rtts_by_ttl, addr_by_ttl = _parse_traceroute_output(stdout, max_ttl)
     ok = (proc.returncode == 0)
     return rtts_by_ttl, addr_by_ttl, ok
+
+# local import to avoid a top-level dependency
+import contextlib  # noqa: E402
