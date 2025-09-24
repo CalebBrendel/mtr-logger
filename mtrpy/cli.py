@@ -3,8 +3,9 @@ from __future__ import annotations
 import argparse
 import asyncio
 import os
+import socket
 from time import perf_counter
-from typing import Optional
+from typing import Optional, Dict, Tuple, List
 
 from .stats import Circuit
 from .tracer import resolve_tracer, run_tracer_round
@@ -17,6 +18,33 @@ from .util import (
     now_local_str,
 )
 
+# ---------------- Reverse DNS cache ----------------
+_rdns_cache: Dict[str, str] = {}
+
+def is_ip(text: str) -> bool:
+    try:
+        socket.inet_pton(socket.AF_INET, text)
+        return True
+    except OSError:
+        pass
+    try:
+        socket.inet_pton(socket.AF_INET6, text)
+        return True
+    except OSError:
+        return False
+
+def reverse_dns(ip: str) -> str:
+    if ip in _rdns_cache:
+        return _rdns_cache[ip]
+    name = ip
+    try:
+        name = socket.gethostbyaddr(ip)[0] or ip
+    except Exception:
+        name = ip
+    _rdns_cache[ip] = name
+    return name
+# ---------------------------------------------------
+
 async def mtr_loop(
     target: str,
     interval: float,
@@ -27,7 +55,7 @@ async def mtr_loop(
     ascii_mode: bool,
     wide: bool,
     duration: Optional[int],  # seconds; None => interactive forever
-    dns_mode: str,
+    dns_mode: str,            # 'auto' | 'on' | 'off'
 ) -> Optional[str]:
     """
     Interactive loop if duration is None; otherwise run for 'duration' seconds and write a log file.
@@ -38,11 +66,19 @@ async def mtr_loop(
     dest_ip = resolved.ip
     tr_path = resolve_tracer()
 
+    # Decide whether to show names or raw IPs for hop addresses:
+    # - If user entered a hostname and dns_mode != 'off' -> show names (like mtr)
+    # - If user entered an IP OR dns_mode == 'off' -> show IPs
+    user_entered_was_ip = is_ip(target)
+    want_names = (dns_mode != "off") and (not user_entered_was_ip)
+
     circuit = Circuit()
     started = perf_counter()
-
-    # first TTL at which we saw the destination; ignore > this TTL
     dest_ttl_found: Optional[int] = None
+
+    # Track printed alerts in interactive mode to avoid repeating same line every refresh
+    # Signature: (ttl, lost_count_total_seen) -> already printed count
+    printed_alerts: Dict[int, int] = {}
 
     from rich.live import Live
     table = build_table(circuit, display_target, started, ascii_mode=ascii_mode, wide=wide)
@@ -63,22 +99,43 @@ async def mtr_loop(
                 except (asyncio.CancelledError, KeyboardInterrupt):
                     break
 
-                # lock on the first TTL that equals the destination IP
+                # If we saw the destination, clamp at that TTL
                 for ttl, addr in addr_by_ttl.items():
                     if addr == dest_ip:
                         if dest_ttl_found is None or ttl < dest_ttl_found:
                             dest_ttl_found = ttl
 
-                # apply only TTLs that appeared; count ALL probes attempted (even if 0 replies)
+                # Fold round results into circuit
                 for ttl, samples in rtts_by_ttl.items():
                     if dest_ttl_found is not None and ttl > dest_ttl_found:
                         continue
                     addr = addr_by_ttl.get(ttl)
+
+                    # Apply reverse-DNS if desired
+                    if addr and want_names:
+                        addr = reverse_dns(addr)
+
                     circuit.update_hop_round(ttl, addr, probes, samples)
 
-                # refresh interactive table
+                # Rebuild and refresh the live table
                 table = build_table(circuit, display_target, started, ascii_mode=ascii_mode, wide=wide)
                 live.update(table, refresh=True)
+
+                # ---- Interactive alerts (incremental lines) ----
+                # For each hop currently showing loss, emit a deduped line
+                # Count loss as (sent - recv) at this moment.
+                now_str = now_local_str()
+                for ttl, hop in circuit.hops.items():
+                    lost = hop.sent - hop.recv
+                    if lost > 0:
+                        prev = printed_alerts.get(ttl, 0)
+                        # only print when the cumulative lost has increased
+                        if lost > prev:
+                            console.print(
+                                f"[bold red]❌ Packet loss detected on hop {ttl} at {now_str} - {lost} packets were lost[/]"
+                            )
+                            printed_alerts[ttl] = lost
+                # ------------------------------------------------
 
                 try:
                     await asyncio.sleep(interval)
@@ -87,7 +144,7 @@ async def mtr_loop(
     except KeyboardInterrupt:
         pass
 
-    # non-interactive export when duration was set
+    # Non-interactive export (atomic write at the end)
     if end_time is not None:
         from .export import write_text_report, alert_lines_for_losses
 
@@ -95,7 +152,7 @@ async def mtr_loop(
         ensure_dir(log_dir)
         out_path = os.path.join(log_dir, timestamp_filename(prefix="mtr", ext=".txt"))
 
-        lines = []
+        lines: List[str] = []
         lines.append(write_text_report(circuit))
         alerts = alert_lines_for_losses(circuit, now_local_str())
         if alerts:
@@ -103,7 +160,6 @@ async def mtr_loop(
             lines.append("Alerts:")
             lines.extend(alerts)
 
-        # atomic write
         tmp_path = out_path + ".tmp"
         with open(tmp_path, "w", encoding="utf-8") as f:
             f.write("\n".join(lines).rstrip() + "\n")
@@ -112,6 +168,7 @@ async def mtr_loop(
         os.replace(tmp_path, out_path)
 
     return out_path
+
 
 def main(argv: Optional[list[str]] = None) -> int:
     ap = argparse.ArgumentParser(
