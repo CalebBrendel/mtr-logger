@@ -1,229 +1,178 @@
 from __future__ import annotations
-import asyncio
-from argparse import ArgumentParser
-from pathlib import Path
-from time import perf_counter, sleep
-from typing import Dict, Tuple, Optional
 
-from rich.console import Console
+import argparse
+import asyncio
+import os
+import sys
+import time
+from contextlib import nullcontext
+
 from rich.live import Live
 
-from .stats import Circuit
-from .tracer import resolve_tracer, run_tracer_round
-from .render import build_table, render_table
 from .util import (
-    resolve_host,
     default_log_dir,
     ensure_dir,
+    resolve_host,
     timestamp_filename,
     now_local_str,
 )
-from .export import IncrementalReport
-
-
-console = Console(color_system="standard", force_terminal=True)
-
-
-# ------------- core async tracer loop helpers -------------
-
-
-async def run_traceroute_round(
-    tracer_bin: str,
-    target_ip: str,
-    max_ttl: int,
-    timeout: float,
-    proto: str,
-    qpr: int,
-) -> Tuple[Dict[int, list], bool]:
-    """
-    Run one traceroute pass. Returns (rtts_by_ttl, ok).
-    rtts_by_ttl: dict of ttl -> list of RTT floats (ms) collected in this round.
-    ok: True if the subprocess completed within timeout margin.
-    """
-    # Use the helper that builds/executes the subprocess and parses stdout
-    try:
-        rtts_by_ttl = await run_tracer_round(
-            tracer_bin, target_ip, max_ttl=max_ttl, timeout=timeout, proto=proto, qpr=qpr
-        )
-        return rtts_by_ttl, True
-    except asyncio.TimeoutError:
-        return {}, False
+from .render import render_table
+from .stats import Circuit
+from .tracer import resolve_tracer, run_tracer_round
+from .export import write_text_report
 
 
 async def mtr_loop(
     target: str,
+    *,
     interval: float,
+    duration: float,
     max_hops: int,
-    nprobes: int,
+    probes: int,
     timeout: float,
     proto: str,
+    dns_mode: str,
     fps: int,
     use_ascii: bool,
-    use_alt_screen: bool,
+    use_screen: bool,
+    export: bool,
+    outfile: str | None,
     wide: bool,
-    dns_mode: str,
-    duration: Optional[int],
-    export_path: Optional[Path],
-) -> Optional[Path]:
-    started = perf_counter()
+) -> str | None:
+    """
+    Core async loop.
+    Returns path to written report (if export=True), else None.
+    """
     resolved = resolve_host(target, dns_mode=dns_mode)
     display_target = resolved.display
-    target_ip = resolved.ip
 
-    # tracer binary
     tr_path = resolve_tracer()
 
-    # circuit accumulator
     circuit = Circuit()
+    started = time.perf_counter()
+    deadline = started + float(duration)
 
-    # incremental exporter?
-    inc: Optional[IncrementalReport] = None
-    if export_path is not None:
-        inc = IncrementalReport(export_path, display_target)
-        # Initial header snapshot (empty stats)
-        inc.append_snapshot(circuit, now_local_str(time_only=True))
+    # Initial renderable
+    table = render_table(circuit, display_target, started, ascii_mode=use_ascii, wide=wide)
 
-    # state for per-round loss alerts
-    prev_counts: Dict[int, Tuple[int, int]] = {}  # ttl -> (sent, recv)
+    # alternate screen context (or no-op)
+    screen_ctx = (console.screen() if use_screen else nullcontext())  # type: ignore[name-defined]
 
-    # Live console rendering setup
-    refresh_per_sec = max(1, int(fps))
-    table = build_table(circuit, display_target, started, ascii_mode=use_ascii)
-    live_ctx = Live(
-        table if not use_alt_screen else console.render(table),
-        console=console,
-        transient=False,
-        refresh_per_second=refresh_per_sec,
-        screen=use_alt_screen,
-    )
+    # Prepare Live with an initial Table
+    with screen_ctx:
+        with Live(table, console=console, refresh_per_second=fps):  # type: ignore[name-defined]
+            # Loop until duration elapses
+            while True:
+                now = time.perf_counter()
+                if now >= deadline:
+                    break
 
-    max_seen_ttl = max_hops
-    end_time = None if duration is None else perf_counter() + float(duration)
+                # One traceroute "round"
+                rtts_by_ttl = await run_tracer_round(
+                    tr_path,
+                    resolved.ip,
+                    max_ttl=max_hops,
+                    timeout=float(timeout),
+                    proto=proto,
+                    qpr=probes,
+                )
 
-    with live_ctx:
-        while True:
-            # end condition
-            if end_time is not None and perf_counter() >= end_time:
-                break
+                # For each hop from 1..max_hops, add samples (or count as lost if no RTTs returned)
+                for ttl in range(1, max_hops + 1):
+                    samples = rtts_by_ttl.get(ttl, [])
+                    if samples:
+                        circuit.update_hop_samples(ttl, None, samples)
+                    else:
+                        # no replies for this TTL this round: count sent only
+                        circuit.update_hop_samples(ttl, None, [])
 
-            # one traceroute pass
-            rtts_by_ttl, ok = await run_traceroute_round(
-                tr_path, target_ip, max_seen_ttl, timeout, proto, nprobes
-            )
+                # Update interactive table
+                new_table = render_table(circuit, display_target, started, ascii_mode=use_ascii, wide=wide)
+                # Live.update requires a renderable (Table). Do NOT pass console.render / strings.
+                Live.get_current().update(new_table)  # type: ignore[attr-defined]
 
-            # integrate samples into circuit
-            for ttl, samples in rtts_by_ttl.items():
-                addr = circuit.hops.get(ttl).address if ttl in circuit.hops else None
-                # update with samples; if addr is None, it will be kept as None '*'
-                circuit.update_hop_samples(ttl, addr, samples)
+                # Sleep to honor interval
+                now2 = time.perf_counter()
+                to_sleep = float(interval) - max(0.0, now2 - now)
+                if to_sleep > 0:
+                    await asyncio.sleep(to_sleep)
 
-            # compute alerts: per-round packet loss deltas
-            alerts = []
-            for ttl, hop in circuit.hops.items():
-                prev_sent, prev_recv = prev_counts.get(ttl, (0, 0))
-                delta_sent = hop.sent - prev_sent
-                delta_recv = hop.recv - prev_recv
-                lost = max(0, delta_sent - delta_recv)
-                prev_counts[ttl] = (hop.sent, hop.recv)
+    # Export if requested
+    if export:
+        log_dir = default_log_dir()
+        ensure_dir(log_dir)
+        if outfile and outfile != "auto":
+            out_path = os.fspath(os.path.join(log_dir, outfile))
+        else:
+            out_path = os.fspath(log_dir / timestamp_filename(prefix="mtr"))
+        write_text_report(out_path, circuit, display_target, started)
+        return out_path
 
-                # skip star/unknown address hops for alerts
-                addr = hop.address or "*"
-                if lost > 0 and addr != "*":
-                    alerts.append(
-                        f"❌ Packet loss detected on hop {ttl} at {now_local_str(time_only=True)} - {lost} packets were lost"
-                    )
-
-            # write incremental snapshot + alerts (tail-able)
-            if inc is not None:
-                inc.append_snapshot(circuit, now_local_str(time_only=True))
-                if alerts:
-                    inc.append_alerts(alerts)
-
-            # update display
-            # (re-resolve display_target if dns_mode='on' and addresses got names — optional)
-            table = build_table(circuit, display_target, started, ascii_mode=use_ascii, wide=wide)
-            live_ctx.update(table)
-
-            # respect interval
-            # If a round ran long, we still sleep (cannot go negative); keeps steady-ish pacing
-            sleep_interval = max(0.0, float(interval))
-            # asyncio-friendly small await to yield back to event loop
-            await asyncio.sleep(sleep_interval)
-
-    # finalize exporter
-    if inc is not None:
-        inc.close()
-        return export_path
     return None
 
 
-# ------------- CLI -------------
+def build_parser() -> argparse.ArgumentParser:
+    ap = argparse.ArgumentParser(
+        prog="mtr-logger",
+        description="Minimal MTR-style logger with interactive TUI and text export.",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
+    ap.add_argument("target", help="Hostname or IP to trace")
+    ap.add_argument("--interval", "-i", type=float, default=0.1, help="Interval between rounds (seconds)")
+    ap.add_argument("--timeout", type=float, default=0.2, help="Per-probe timeout (seconds)")
+    ap.add_argument("--max-hops", type=int, default=30, help="Maximum hops (max TTL)")
+    ap.add_argument("--probes", "-p", type=int, default=3, help="Queries per hop (traceroute -q)")
+    ap.add_argument("--proto", choices=("udp", "icmp", "tcp"), default="icmp", help="Probe protocol")
+    ap.add_argument("--fps", type=int, default=6, help="Interactive refresh rate")
+    ap.add_argument("--ascii", action="store_true", help="Use ASCII borders")
+    ap.add_argument("--no-screen", action="store_true", help="Disable alternate screen")
+    ap.add_argument("--dns", choices=("auto", "on", "off"), default="auto", help="DNS display mode")
+    ap.add_argument("--duration", type=float, default=120.0, help="Total run time (seconds)")
+
+    # export / logging
+    ap.add_argument("--export", action="store_true", help="Write a text report at the end")
+    ap.add_argument("--outfile", default="auto", help='Output filename (or "auto" for timestamped)')
+
+    # formatting
+    ap.add_argument("--order", choices=("hop", "loss", "avg", "best", "wrst"), default="hop", help="Sort order")
+    ap.add_argument("--wide", action="store_true", help="Wider table (if your terminal supports it)")
+
+    return ap
 
 
-def main(argv: Optional[list] = None) -> int:
-    ap = ArgumentParser(prog="mtr-logger")
-    ap.add_argument("target", help="destination hostname or IP")
-    ap.add_argument("--interval", "-i", type=float, default=0.1, help="seconds between rounds (default: 0.1)")
-    ap.add_argument("--max-hops", type=int, default=30)
-    ap.add_argument("--probes", "-p", type=int, default=3, help="probes per hop per round")
-    ap.add_argument("--timeout", type=float, default=0.2, help="per-probe timeout (seconds)")
-    ap.add_argument("--proto", choices=("udp", "icmp", "tcp"), default="icmp")
-    ap.add_argument("--fps", type=int, default=6, help="UI refresh rate (interactive)")
-    ap.add_argument("--ascii", action="store_true", help="use ASCII borders")
-    ap.add_argument("--no-screen", action="store_true", help="avoid alternate screen mode")
-    ap.add_argument("--dns", choices=("auto", "on", "off"), default="auto")
-    ap.add_argument("--count", type=int, help="(deprecated) total rounds; prefer --duration")
-    ap.add_argument("--duration", type=int, help="run for N seconds then stop")
-    ap.add_argument("--order", default="default", help="unused (compat)")
-    ap.add_argument("--wide", action="store_true", help="wider table")
-    ap.add_argument("--export", action="store_true", help="export (incremental) log to file")
-    ap.add_argument("--outfile", help='path for export; use "auto" to pick ~/mtr/logs/mtr-<timestamp>.txt')
+def main(argv: list[str] | None = None) -> int:
+    # Delay import here so console is available to mtr_loop
+    global console  # rich Console from render.py
+    from .render import console as _console  # import once
+    console = _console
 
+    ap = build_parser()
     args = ap.parse_args(argv)
 
-    # figure export path
-    export_path: Optional[Path] = None
-    if args.export or args.outfile:
-        if args.outfile and args.outfile != "auto":
-            export_path = Path(args.outfile).expanduser()
-            ensure_dir(export_path.parent)
-        else:
-            log_dir = default_log_dir()
-            ensure_dir(log_dir)
-            export_path = log_dir / timestamp_filename(prefix="mtr", ext=".txt")
-
-    use_ascii = bool(args.ascii)
-    use_alt_screen = not bool(args.no_screen)
-    wide = bool(args.wide)
-
-    # run
-    path = asyncio.run(
+    # Run loop
+    out_path = asyncio.run(
         mtr_loop(
             args.target,
             interval=args.interval,
+            duration=args.duration,
             max_hops=args.max_hops,
-            nprobes=args.probes,
+            probes=args.probes,
             timeout=args.timeout,
             proto=args.proto,
-            fps=args.fps,
-            use_ascii=use_ascii,
-            use_alt_screen=use_alt_screen,
-            wide=wide,
             dns_mode=args.dns,
-            duration=args.duration,
-            export_path=export_path,
+            fps=args.fps,
+            use_ascii=args.ascii,
+            use_screen=not args.no_screen,
+            export=args.export,
+            outfile=args.outfile,
+            wide=args.wide,
         )
     )
 
-    # print path at end for cron/self-test convenience
-    if path is not None:
-        print(path)
+    if out_path:
+        print(out_path)
     return 0
 
 
-def run():  # convenience
-    raise SystemExit(main())
-
-
 if __name__ == "__main__":
-    run()
+    raise SystemExit(main())
