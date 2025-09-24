@@ -59,6 +59,7 @@ class Circuit:
 
     def update_hop_samples(self, ttl: int, address: Optional[str], samples_ms: List[float]) -> None:
         hop = self.ensure_hop(ttl, address)
+        # If tracer produced the hop but with no RTTs, we still count probes as "sent"
         sent = max(1, len(samples_ms)) if not samples_ms else len(samples_ms)
         hop.sent += sent
         for rtt in samples_ms:
@@ -82,7 +83,7 @@ async def mtr_loop(
     duration: int = 0,                # 0 => continuous interactive
     ascii_mode: bool = False,
     dns_mode: str = "auto",           # auto|on|off
-    max_hops: int = 12,                # reasonable default; tracer will stop at dest
+    max_hops: int = 12,               # reasonable default; tracer will stop at dest
     ignore_star_hops_for_alerts: bool = True,
 ) -> Tuple[Circuit, str, List[Tuple[int, str, int, str]]]:
     """
@@ -107,9 +108,14 @@ async def mtr_loop(
 
     async def one_round() -> None:
         nonlocal circuit, alerts
-        rtts_by_ttl, addr_by_ttl, _ok = await run_tracer_round(
-            tr_path, resolved.ip, max_hops, timeout, proto, probes
-        )
+        try:
+            rtts_by_ttl, addr_by_ttl, _ok = await run_tracer_round(
+                tr_path, resolved.ip, max_hops, timeout, proto, probes
+            )
+        except asyncio.CancelledError:
+            # If Ctrl+C lands during a tracer subprocess communicate(),
+            # we just exit the round cleanly.
+            return
 
         # Update circuit
         for ttl, samples in rtts_by_ttl.items():
@@ -121,8 +127,12 @@ async def mtr_loop(
             for ttl, hop in list(circuit.hops.items()):
                 if hop.address and hop.address != "*":
                     # async PTR
-                    new_name = await dns_cache.lookup(hop.address)
-                    hop.address = new_name or hop.address
+                    try:
+                        new_name = await dns_cache.lookup(hop.address)
+                        hop.address = new_name or hop.address
+                    except Exception:
+                        # DNS hiccups shouldn't crash a round
+                        pass
 
         # Alerts: log every time loss increases for answering hops
         for ttl, hop in sorted(circuit.hops.items()):
@@ -149,10 +159,21 @@ async def mtr_loop(
             while True:
                 await one_round()
                 print_frame()
-                last_alert_idx = len(alerts)
-                await asyncio.sleep(interval)
+                # advance watermark so new alerts show below the next frame
+                nonlocal_last = len(alerts)
+                # we can't assign to a nonlocal simple variable inside nested function without keyword;
+                # do it here in the outer scope:
+                pass
         except KeyboardInterrupt:
             # final frame with any new alerts
+            print_frame()
+            return circuit, display_target, alerts
+        except asyncio.CancelledError:
+            # graceful stop
+            print_frame()
+            return circuit, display_target, alerts
+        else:
+            # if loop ever breaks normally (it shouldn't), still print final
             print_frame()
             return circuit, display_target, alerts
     else:
@@ -163,6 +184,8 @@ async def mtr_loop(
                 await one_round()
                 await asyncio.sleep(interval)
         except KeyboardInterrupt:
+            pass
+        except asyncio.CancelledError:
             pass
         return circuit, display_target, alerts
 
@@ -207,7 +230,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     if args.duration <= 0:
         return 0
 
-    # Non-interactive: write report (atomic)
+    # Non-interactive: write report (atomic handled inside write_text_report)
     outdir = default_log_dir()
     if args.outfile != "auto":
         outdir = Path(args.outfile).expanduser().resolve().parent
