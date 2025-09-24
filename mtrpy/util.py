@@ -1,13 +1,15 @@
 from __future__ import annotations
 import asyncio
+import contextlib
 import os
 import socket
 import sys
+import tempfile
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from shutil import which as _which
-from typing import Iterable, Optional
+from typing import Iterable, Optional, Union
 
 IS_WINDOWS = sys.platform.startswith("win")
 
@@ -19,14 +21,18 @@ def ensure_dir(p: Path) -> None:
 
 
 def default_log_dir() -> Path:
-    # Keep behavior consistent with earlier versions
+    """
+    Default logs directory under ~/mtr/logs, created if missing.
+    """
     base = Path.home() / "mtr" / "logs"
     ensure_dir(base)
     return base
 
 
 def timestamp_filename(prefix: str = "mtr", ext: str = ".txt") -> str:
-    # mtr-09-24-2025-01-51-57.txt
+    """
+    Return a filename like: mtr-09-24-2025-01-51-57.txt
+    """
     ts = datetime.now().strftime("%m-%d-%Y-%H-%M-%S")
     return f"{prefix}-{ts}{ext}"
 
@@ -42,9 +48,33 @@ def now_local_str(time_only: bool = False) -> str:
     now = datetime.now()
     if time_only:
         s = now.strftime("%I:%M:%S%p")
-        # drop leading zero from hour
-        return s.lstrip("0")
+        return s.lstrip("0")  # drop leading zero from hour
     return f"{now.strftime('%m-%d-%Y')} {now.strftime('%I:%M:%S%p').lstrip('0')}"
+
+
+# ---------- atomic file write ----------
+
+def atomic_write_text(path: Union[str, Path], text: str) -> None:
+    """
+    Atomically write text to a file:
+      1) write to temp file in the same directory
+      2) fsync
+      3) os.replace to final path
+    Safe against partial writes if the system crashes mid-write.
+    """
+    path = Path(path)
+    ensure_dir(path.parent)
+    fd, tmppath = tempfile.mkstemp(prefix=".tmp", dir=str(path.parent))
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(text)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmppath, str(path))
+    finally:
+        with contextlib.suppress(FileNotFoundError):
+            if os.path.exists(tmppath):
+                os.unlink(tmppath)
 
 
 # ---------- process helpers ----------
@@ -62,7 +92,6 @@ async def run_proc(*args: str, timeout: Optional[float] = None) -> tuple[bytes, 
     try:
         out_b, err_b = await asyncio.wait_for(proc.communicate(), timeout=timeout)
     except asyncio.TimeoutError:
-        # Best effort: terminate and wait briefly
         with contextlib.suppress(ProcessLookupError):
             proc.kill()
         raise
@@ -91,36 +120,30 @@ def resolve_host(target: str, dns_mode: str = "auto") -> ResolvedHost:
     """
     Resolve to a numeric IP for probing, and decide display string.
     dns_mode:
-      - 'off': never do reverse names here (display is the input target or ip)
-      - 'on' : prefer names for display when available
-      - 'auto': keep given name for display if it wasn't a numeric IP
+      - 'off': never do reverse names here (display is the ip)
+      - 'on' : prefer names for display when available (handled later in CLI)
+      - 'auto': keep given hostname for display if it isn't a numeric IP
     """
-    # Forward resolution: prefer IPv4 first, else whatever comes first
     ip = None
     try:
-        # getaddrinfo(None) fallback avoided; we must resolve target
         infos = socket.getaddrinfo(target, None)
-        # prefer AF_INET
+        # prefer IPv4 over IPv6 if available
         infos_sorted = sorted(infos, key=lambda x: 0 if x[0] == socket.AF_INET else 1)
         for family, _type, _proto, _canon, sockaddr in infos_sorted:
             if family in (socket.AF_INET, socket.AF_INET6):
                 ip = sockaddr[0]
                 break
     except Exception:
-        # if target already appears numeric, keep it
         ip = target
 
     if ip is None:
         ip = target
 
-    # Decide display string
-    disp = target
+    # decide display
     if dns_mode == "off":
         disp = ip
     else:
-        # 'on' and 'auto' -> keep original hostname if it isn't an IP literal
-        # naive check: if it has letters, it's likely a hostname
-        if all(ch.isdigit() or ch in ".:[]" for ch in target):
-            disp = ip
+        # keep original hostname if it isn't an IP literal
+        disp = target if any(ch.isalpha() for ch in target) else ip
 
     return ResolvedHost(ip=ip, display=disp)
