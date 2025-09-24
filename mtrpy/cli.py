@@ -80,7 +80,7 @@ async def mtr_loop(
     duration: int = 0,                # 0 => continuous interactive
     ascii_mode: bool = False,
     dns_mode: str = "auto",           # auto|on|off
-    max_hops: int = 12,               # tracer will stop at dest; we cap display
+    max_hops: int = 12,
     ignore_star_hops_for_alerts: bool = True,
 ) -> Tuple[Circuit, str, List[Tuple[int, str, int, str]]]:
     """
@@ -99,32 +99,26 @@ async def mtr_loop(
     circuit = Circuit(started_at=started)
     dns_cache = ReverseDNSCache()
 
-    # (ttl, addr, lost, timestamp)
     alerts: List[Tuple[int, str, int, str]] = []
     last_alert_idx = 0
-
-    # Track the last reported "lost" per hop to avoid duplicate alerts
     last_reported_lost: Dict[int, int] = {}
 
     async def one_round() -> None:
-        nonlocal circuit, alerts
+        nonlocal alerts
         rtts_by_ttl, addr_by_ttl, _ok = await run_tracer_round(
             tr_path, resolved.ip, max_hops, timeout, proto, probes
         )
 
-        # Update circuit
         for ttl, samples in rtts_by_ttl.items():
             addr_raw = addr_by_ttl.get(ttl)
             circuit.update_hop_samples(ttl, addr_raw, samples)
 
-        # Reverse DNS fill-in if requested
         if dns_mode != "off":
             for ttl, hop in list(circuit.hops.items()):
                 if hop.address and hop.address != "*":
                     new_name = await dns_cache.lookup(hop.address)
                     hop.address = new_name or hop.address
 
-        # Alerts: only when "lost" increases since last time
         for ttl, hop in sorted(circuit.hops.items()):
             if ignore_star_hops_for_alerts and (hop.address in (None, "*")):
                 continue
@@ -135,36 +129,25 @@ async def mtr_loop(
                 last_reported_lost[ttl] = current_lost
                 alerts.append((ttl, hop.address or "*", current_lost, now_local_str()))
 
-    # Interactive print function
     def print_frame() -> None:
         table = build_table(circuit, display_target, circuit.started_at, ascii_mode=ascii_mode, wide=False)
         console.clear()
         console.print(table)
-        # print any new alerts below table
         if last_alert_idx < len(alerts):
             for ttl, addr, lost, ts in alerts[last_alert_idx:]:
                 console.print(f"❌ Packet loss detected on hop {ttl} ({addr}) at {ts} - {lost} packets lost")
 
-    # Run
     if duration <= 0:
-        # Interactive continuous
         try:
             while True:
                 await one_round()
                 print_frame()
-                # we have printed everything up to current len(alerts)
-                nonlocal_last = len(alerts)  # local variable to satisfy mypy thinking
-                nonlocal_last  # no-op
-                # update outer variable
-                nonlocal last_alert_idx
                 last_alert_idx = len(alerts)
                 await asyncio.sleep(interval)
         except (asyncio.CancelledError, KeyboardInterrupt):
-            # final frame with any alerts we haven't shown yet
             print_frame()
             return circuit, display_target, alerts
     else:
-        # Timed run (non-interactive) — just loop for duration, no live printing
         try:
             deadline = time.perf_counter() + duration
             while time.perf_counter() < deadline:
@@ -211,14 +194,11 @@ def main(argv: Optional[List[str]] = None) -> int:
             )
         )
     except KeyboardInterrupt:
-        # Should be rare now, but keep a hard guard to avoid tracebacks
         return 0
 
-    # If interactive (duration==0): we already printed; nothing to export
     if args.duration <= 0:
         return 0
 
-    # Non-interactive: write report (atomic handled in export.write_text_report)
     outdir = default_log_dir()
     if args.outfile != "auto":
         outdir = Path(args.outfile).expanduser().resolve().parent
