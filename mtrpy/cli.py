@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import argparse
 import asyncio
-import os
 import sys
 import time
 from dataclasses import dataclass, field
@@ -20,7 +19,6 @@ from .util import (
     resolve_host,
     timestamp_filename,
 )
-
 
 # ---------------- Data model ----------------
 
@@ -59,7 +57,6 @@ class Circuit:
 
     def update_hop_samples(self, ttl: int, address: Optional[str], samples_ms: List[float]) -> None:
         hop = self.ensure_hop(ttl, address)
-        # If tracer produced the hop but with no RTTs, we still count probes as "sent"
         sent = max(1, len(samples_ms)) if not samples_ms else len(samples_ms)
         hop.sent += sent
         for rtt in samples_ms:
@@ -83,7 +80,7 @@ async def mtr_loop(
     duration: int = 0,                # 0 => continuous interactive
     ascii_mode: bool = False,
     dns_mode: str = "auto",           # auto|on|off
-    max_hops: int = 12,               # reasonable default; tracer will stop at dest
+    max_hops: int = 12,               # tracer will stop at dest; we cap display
     ignore_star_hops_for_alerts: bool = True,
 ) -> Tuple[Circuit, str, List[Tuple[int, str, int, str]]]:
     """
@@ -101,21 +98,19 @@ async def mtr_loop(
     started = time.perf_counter()
     circuit = Circuit(started_at=started)
     dns_cache = ReverseDNSCache()
-    alerts: List[Tuple[int, str, int, str]] = []
 
-    # last_printed_alerts index
+    # (ttl, addr, lost, timestamp)
+    alerts: List[Tuple[int, str, int, str]] = []
     last_alert_idx = 0
+
+    # Track the last reported "lost" per hop to avoid duplicate alerts
+    last_reported_lost: Dict[int, int] = {}
 
     async def one_round() -> None:
         nonlocal circuit, alerts
-        try:
-            rtts_by_ttl, addr_by_ttl, _ok = await run_tracer_round(
-                tr_path, resolved.ip, max_hops, timeout, proto, probes
-            )
-        except asyncio.CancelledError:
-            # If Ctrl+C lands during a tracer subprocess communicate(),
-            # we just exit the round cleanly.
-            return
+        rtts_by_ttl, addr_by_ttl, _ok = await run_tracer_round(
+            tr_path, resolved.ip, max_hops, timeout, proto, probes
+        )
 
         # Update circuit
         for ttl, samples in rtts_by_ttl.items():
@@ -126,21 +121,19 @@ async def mtr_loop(
         if dns_mode != "off":
             for ttl, hop in list(circuit.hops.items()):
                 if hop.address and hop.address != "*":
-                    # async PTR
-                    try:
-                        new_name = await dns_cache.lookup(hop.address)
-                        hop.address = new_name or hop.address
-                    except Exception:
-                        # DNS hiccups shouldn't crash a round
-                        pass
+                    new_name = await dns_cache.lookup(hop.address)
+                    hop.address = new_name or hop.address
 
-        # Alerts: log every time loss increases for answering hops
+        # Alerts: only when "lost" increases since last time
         for ttl, hop in sorted(circuit.hops.items()):
             if ignore_star_hops_for_alerts and (hop.address in (None, "*")):
                 continue
-            if hop.sent > hop.recv:
-                lost = hop.sent - hop.recv
-                alerts.append((ttl, hop.address or "*", lost, now_local_str()))
+            current_lost = hop.sent - hop.recv
+            if current_lost <= 0:
+                continue
+            if current_lost > last_reported_lost.get(ttl, 0):
+                last_reported_lost[ttl] = current_lost
+                alerts.append((ttl, hop.address or "*", current_lost, now_local_str()))
 
     # Interactive print function
     def print_frame() -> None:
@@ -159,21 +152,15 @@ async def mtr_loop(
             while True:
                 await one_round()
                 print_frame()
-                # advance watermark so new alerts show below the next frame
-                nonlocal_last = len(alerts)
-                # we can't assign to a nonlocal simple variable inside nested function without keyword;
-                # do it here in the outer scope:
-                pass
-        except KeyboardInterrupt:
-            # final frame with any new alerts
-            print_frame()
-            return circuit, display_target, alerts
-        except asyncio.CancelledError:
-            # graceful stop
-            print_frame()
-            return circuit, display_target, alerts
-        else:
-            # if loop ever breaks normally (it shouldn't), still print final
+                # we have printed everything up to current len(alerts)
+                nonlocal_last = len(alerts)  # local variable to satisfy mypy thinking
+                nonlocal_last  # no-op
+                # update outer variable
+                nonlocal last_alert_idx
+                last_alert_idx = len(alerts)
+                await asyncio.sleep(interval)
+        except (asyncio.CancelledError, KeyboardInterrupt):
+            # final frame with any alerts we haven't shown yet
             print_frame()
             return circuit, display_target, alerts
     else:
@@ -183,9 +170,7 @@ async def mtr_loop(
             while time.perf_counter() < deadline:
                 await one_round()
                 await asyncio.sleep(interval)
-        except KeyboardInterrupt:
-            pass
-        except asyncio.CancelledError:
+        except (asyncio.CancelledError, KeyboardInterrupt):
             pass
         return circuit, display_target, alerts
 
@@ -211,26 +196,29 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     args = build_arg_parser().parse_args(argv)
 
-    # interactive if duration == 0
-    circuit, display_target, alerts = asyncio.run(
-        mtr_loop(
-            args.target,
-            proto=args.proto,
-            interval=args.interval,
-            probes=args.probes,
-            timeout=args.timeout,
-            duration=args.duration,
-            ascii_mode=args.ascii,
-            dns_mode=args.dns,
-            max_hops=args.max_hops,
+    try:
+        circuit, display_target, alerts = asyncio.run(
+            mtr_loop(
+                args.target,
+                proto=args.proto,
+                interval=args.interval,
+                probes=args.probes,
+                timeout=args.timeout,
+                duration=args.duration,
+                ascii_mode=args.ascii,
+                dns_mode=args.dns,
+                max_hops=args.max_hops,
+            )
         )
-    )
+    except KeyboardInterrupt:
+        # Should be rare now, but keep a hard guard to avoid tracebacks
+        return 0
 
     # If interactive (duration==0): we already printed; nothing to export
     if args.duration <= 0:
         return 0
 
-    # Non-interactive: write report (atomic handled inside write_text_report)
+    # Non-interactive: write report (atomic handled in export.write_text_report)
     outdir = default_log_dir()
     if args.outfile != "auto":
         outdir = Path(args.outfile).expanduser().resolve().parent
