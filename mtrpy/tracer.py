@@ -1,77 +1,105 @@
 from __future__ import annotations
-
 import asyncio
 import re
-from dataclasses import dataclass
-from typing import List, Optional
+from typing import Dict, List, Optional
 
-from .util import which, run_proc, IS_WINDOWS
+from .util import which, IS_WINDOWS
 
-TRACEROUTE_CMDS = ["traceroute"]
+# Candidate tracer binaries by platform
+TRACEROUTE_CMDS = [
+    "traceroute",          # GNU/modern
+    "traceroute.db",       # Debian's alternatives wrapper
+    "traceproto",          # sometimes present with traceroute package
+    "/usr/sbin/tcptraceroute",  # legacy tcptraceroute
+]
 TRACERT_CMDS = ["tracert"]
 
-@dataclass
-class Hop:
-    ttl: int
-    address: Optional[str]
 
-def resolve_tracer() -> Optional[str]:
+def resolve_tracer() -> str:
+    """
+    Return a tracer binary path or raise if not found.
+    """
     if IS_WINDOWS:
-        return which(TRACERT_CMDS)
-    return which(TRACEROUTE_CMDS)
-
-# numeric-only parse for discovery
-LINE_RE = re.compile(r"^\s*(\d+)\s+(.+)$")
-ADDR_RE = re.compile(r"^\s*(\d+)\s+(\S+)")
-
-async def trace(target_ip: str, *, max_hops: int = 30, nprobes: int = 3, timeout: float = 0.7, proto: str = "icmp") -> List[Hop]:
-    """
-    Run a single traceroute to discover TTLs and numeric addresses.
-    We use -n (no DNS) to keep discovery fast. Caller handles display DNS.
-    """
-    tr = resolve_tracer()
-    if not tr:
+        p = which(TRACERT_CMDS)
+    else:
+        p = which(TRACEROUTE_CMDS)
+    if not p:
         raise RuntimeError("No traceroute/tracert found on PATH. Please install it.")
+    return p
 
-    if IS_WINDOWS:
-        # Windows 'tracert' numeric: -d (no DNS), -h max_hops
-        cmd = [tr, "-d", "-h", str(max_hops), target_ip]
-        rc, out, err = await run_proc(cmd, timeout=timeout * max_hops + 3)
-        text = out or err or ""
-        hops: List[Hop] = []
-        for line in text.splitlines():
-            # crude parse: lines start with hop number, and possibly IP later
-            m = LINE_RE.match(line)
-            if not m:
-                continue
-            ttl = int(m.group(1))
-            addr = None
-            parts = line.split()
-            for tok in parts[1:]:
-                if tok.count(".") == 3:
-                    addr = tok
-                    break
-            hops.append(Hop(ttl=ttl, address=addr))
-        return hops
 
-    # Unix traceroute
-    cmd = [tr, "-n", "-q", str(max(1, nprobes)), "-w", f"{max(0.3, float(timeout)):.1f}", "-m", str(max_hops), target_ip]
-    p = (proto or "icmp").lower()
-    if p == "icmp":
-        cmd.append("-I")
-    elif p == "tcp":
-        cmd.append("-T")
+# --------- output parsing helpers ---------
 
-    rc, out, err = await run_proc(cmd, timeout=timeout * max_hops + 3)
-    text = out or err or ""
-    hops: List[Hop] = []
-    for line in text.splitlines():
-        m = ADDR_RE.match(line)
+_rt_ms = re.compile(r"([0-9]+(?:\.[0-9]+)?)\s*ms", re.IGNORECASE)
+_hop_num = re.compile(r"^\s*(\d+)\s+")
+
+
+def _parse_traceroute_stdout(stdout: str) -> Dict[int, List[float]]:
+    """
+    Parse traceroute-like output into {ttl: [rtt_ms, ...]}.
+    Tolerant to different packaging formats; collects every 'NNN ms' token per hop line.
+    """
+    hops: Dict[int, List[float]] = {}
+    for line in stdout.splitlines():
+        m = _hop_num.match(line)
         if not m:
             continue
         ttl = int(m.group(1))
-        addr = m.group(2)
-        if addr == "*":
-            addr = None
-        hops.append(Hop(ttl=ttl, address=addr))
+        rtts: List[float] = []
+        for ms in _rt_ms.findall(line):
+            try:
+                rtts.append(float(ms))
+            except ValueError:
+                pass
+        # '*' only lines produce zero rtts; caller will treat as all-lost for that round
+        hops[ttl] = rtts
     return hops
+
+
+# --------- one-round runner ---------
+
+async def run_tracer_round(
+    tracer_bin: str,
+    target_ip: str,
+    *,
+    max_ttl: int,
+    timeout: float,
+    proto: str,
+    qpr: int,
+) -> Dict[int, List[float]]:
+    """
+    Execute a single traceroute pass and parse rtts.
+    - proto: 'icmp' uses traceroute -I, 'tcp' -> -T, 'udp' -> default
+    - qpr: queries per hop (traceroute -q)
+    - timeout: per-probe timeout (traceroute -w)
+    We add a small cushion to the outer wait to allow the process to exit cleanly.
+    """
+    if IS_WINDOWS:
+        # Fallback: basic tracert (no per-probe control); still parse ms tokens
+        # tracert options:
+        #   -h max_ttl
+        #   -w timeout_ms
+        to_ms = max(1, int(float(timeout) * 1000))
+        args = [tracer_bin, "-h", str(max_ttl), "-w", str(to_ms), target_ip]
+    else:
+        args = [tracer_bin, "-n", "-m", str(max_ttl), "-q", str(qpr), "-w", str(float(timeout))]
+        if proto == "icmp":
+            args.append("-I")
+        elif proto == "tcp":
+            args.append("-T")
+        # udp => default
+        args.append(target_ip)
+
+    proc = await asyncio.create_subprocess_exec(
+        *args, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
+    )
+    try:
+        # give traceroute a small grace window beyond per-probe timeout
+        out_b, err_b = await asyncio.wait_for(proc.communicate(), timeout=float(timeout) + 2.0)
+    except asyncio.TimeoutError:
+        with contextlib.suppress(ProcessLookupError):
+            proc.kill()
+        raise
+    out_s = out_b.decode(errors="replace")
+    # We ignore stderr; some builds print warnings there
+    return _parse_traceroute_stdout(out_s)
