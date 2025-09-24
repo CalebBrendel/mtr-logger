@@ -1,104 +1,121 @@
 from __future__ import annotations
-from pathlib import Path
-from typing import Iterable, Optional, List
 
-from .stats import Circuit, HopStat
-from .util import ensure_dir, now_local_str
+import os
+import io
+from datetime import datetime
+from typing import Iterable
 
+# --- helpers ---------------------------------------------------------------
 
-# Fixed-width columns to match your previous logs
-HEADERS = ("Hop", "Address", "Loss%", "Snt", "Recv", "Avg", "Best", "Wrst")
-COLS = (4, 42, 7, 5, 5, 6, 6, 6)  # widths per column (kept consistent)
+def _fmt_ms(v: float | None) -> str:
+    return f"{v:.1f}" if v is not None else "-"
 
+def _fmt_time_12h(dt: datetime) -> str:
+    # e.g. "1:02:11PM"
+    return dt.strftime("%I:%M:%S%p").lstrip("0")
 
-def _fmt_ms(v: Optional[float]) -> str:
-    return "-" if v is None else f"{v:.1f}"
+def _build_table_lines(circuit, target: str, started_ts: float) -> list[str]:
+    """
+    Build the plain-text MTR-style table as a list of lines (without trailing \n).
+    We don't rely on circuit.as_rows(); we iterate its internal hops map.
+    """
+    # Header
+    lines: list[str] = []
+    title = f" Hop  Address                                     Loss%  Snt  Recv   Avg  Best   Wrst"
+    sep   = f" ---  ------------------------------------------  -----  ----  ----  ----  ----  -----"
+    lines.append(title)
+    lines.append(sep)
 
-
-def _fmt_addr(addr: Optional[str]) -> str:
-    return "*" if not addr else addr
-
-
-def _row_line(hop: HopStat) -> str:
-    cells = (
-        f"{hop.ttl:>3}",
-        f"{_fmt_addr(hop.address):<42}",
-        f"{hop.loss_pct:>5.0f}",
-        f"{hop.sent:>5}",
-        f"{hop.recv:>5}",
-        f"{_fmt_ms(hop.avg_ms):>6}",
-        f"{_fmt_ms(hop.best_ms):>6}",
-        f"{_fmt_ms(hop.worst_ms):>6}",
-    )
-    return f" {cells[0]:>3}  {cells[1]:<42}  {cells[2]:>5}  {cells[3]:>3}  {cells[4]:>4}  {cells[5]:>4}  {cells[6]:>4}  {cells[7]:>5}"
-
-
-def _header_line() -> str:
-    cells = (
-        f"{HEADERS[0]:>3}",
-        f"{HEADERS[1]:<42}",
-        f"{HEADERS[2]:>5}",
-        f"{HEADERS[3]:>3}",
-        f"{HEADERS[4]:>4}",
-        f"{HEADERS[5]:>4}",
-        f"{HEADERS[6]:>4}",
-        f"{HEADERS[7]:>5}",
-    )
-    return f" {cells[0]:>3}  {cells[1]:<42}  {cells[2]:>5}  {cells[3]:>3}  {cells[4]:>4}  {cells[5]:>4}  {cells[6]:>4}  {cells[7]:>5}"
-
-
-def _rule_line() -> str:
-    # A separator line sized to the header
-    return " ---  " + "-" * 42 + "  -----  ---  ----  ----  ----  -----"
-
-
-def build_text_table(circuit: Circuit) -> List[str]:
-    """Return a list of text lines representing the current table snapshot."""
-    lines: List[str] = []
-    lines.append(_header_line())
-    lines.append(_rule_line())
-
+    # Body: hop stats in numeric TTL order
+    # circuit.hops is expected to be Dict[int, HopStat]
     for ttl in sorted(circuit.hops.keys()):
         hop = circuit.hops[ttl]
-        lines.append(_row_line(hop))
+        address = hop.address or "*"
+        sent = hop.sent
+        recv = hop.recv
+        loss = 0 if sent == 0 else int(round(sent - recv))
+        loss_pct = 0.0 if sent == 0 else (100.0 * (1.0 - (recv / sent)))
+
+        # Widths chosen to match your previous log format
+        #   Hop: 3 right
+        #   Address: 42 left
+        #   Loss%: 5 right (integer)
+        #   Snt/Recv: 4 right
+        #   Avg/Best/Wrst: 4 right (strings; '-' or N.N)
+        line = (
+            f"{ttl:>3}  "
+            f"{address:<42}  "
+            f"{int(round(loss_pct)):>5}  "
+            f"{sent:>4}  "
+            f"{recv:>4}  "
+            f"{_fmt_ms(hop.avg_ms):>4}  "
+            f"{_fmt_ms(hop.best_ms):>4}  "
+            f"{_fmt_ms(hop.worst_ms):>5}"
+        )
+        lines.append(line)
 
     return lines
 
-
-class IncrementalReport:
+def _build_alert_lines(circuit) -> list[str]:
     """
-    Opens the log file once and appends a timestamped snapshot after each round,
-    plus any alerts observed in that round. Safe to tail in real time.
+    Build the 'Alerts:' section lines. Writes one line per hop that shows any loss
+    observed at report time (repeats are fine by design).
     """
+    lines: list[str] = []
+    now_str = _fmt_time_12h(datetime.now())
+    for ttl in sorted(circuit.hops.keys()):
+        hop = circuit.hops[ttl]
+        lost = max(0, hop.sent - hop.recv)
+        if lost > 0 and (hop.address or "*") != "*":
+            lines.append(f"❌ Packet loss detected on hop {ttl} at {now_str} - {lost} packets were lost")
+    return lines
 
-    def __init__(self, path: Path, target: str):
-        ensure_dir(path.parent)
-        self.path = path
-        self._fp = path.open("a", encoding="utf-8")
-        self._write_title(target)
+def _atomic_write_text(path: str, text: str) -> None:
+    """
+    Write to path atomically:
+      - write to path.tmp
+      - flush + fsync
+      - os.replace(tmp, path)
+    """
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    tmp = f"{path}.tmp"
+    # Use utf-8, no BOM
+    with open(tmp, "w", encoding="utf-8", newline="\n") as f:
+        f.write(text)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp, path)
 
-    def _write_title(self, target: str) -> None:
-        self._fp.write(f"=== mtr-logger → {target} ===\n")
-        self._fp.flush()
+# --- public API ------------------------------------------------------------
 
-    def append_snapshot(self, circuit: Circuit, when_str: Optional[str] = None) -> None:
-        ts = when_str or now_local_str(time_only=True)
-        self._fp.write(f"\nSnapshot @ {ts}\n")
-        for line in build_text_table(circuit):
-            self._fp.write(line + "\n")
-        self._fp.flush()
+def write_text_report(path: str, circuit, target: str, started_ts: float) -> None:
+    """
+    Build the final plain-text report (table + Alerts) and write it atomically.
+    Signature matches cli.py: write_text_report(out_path, circuit, display_target, started)
+    """
+    buf = io.StringIO()
+    # Table
+    for line in _build_table_lines(circuit, target, started_ts):
+        buf.write(line)
+        buf.write("\n")
 
-    def append_alerts(self, alerts: Iterable[str]) -> None:
-        alerts = list(alerts)
-        if not alerts:
-            return
-        self._fp.write("\nAlerts:\n")
+    # Alerts section
+    alerts = _build_alert_lines(circuit)
+    if alerts:
+        buf.write("\nAlerts:\n")
         for line in alerts:
-            self._fp.write(line + "\n")
-        self._fp.flush()
+            buf.write(line)
+            buf.write("\n")
 
-    def close(self) -> None:
-        try:
-            self._fp.flush()
-        finally:
-            self._fp.close()
+    _atomic_write_text(path, buf.getvalue())
+
+
+# Optional: a simple helper you can call from the loop if you decide to append
+# “live” alert lines to a sidecar file. Not used by cli.py unless you wire it in.
+def append_alert_line(alert_file: str, line: str) -> None:
+    os.makedirs(os.path.dirname(alert_file) or ".", exist_ok=True)
+    with open(alert_file, "a", encoding="utf-8", newline="\n") as f:
+        f.write(line.rstrip("\n"))
+        f.write("\n")
+        f.flush()
+        os.fsync(f.fileno())
