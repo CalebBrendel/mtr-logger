@@ -76,7 +76,21 @@ start_cron_service(){
   if pgrep -x cron >/dev/null 2>&1 || pgrep -x crond >/dev/null 2>&1; then echo "    - cron/crond is running"; else echo "    - Could not verify an active cron unit; please check manually."; fi
 }
 validate_factor_of_60(){ case "$1" in 1|2|3|4|5|6|10|12|15|20|30|60) return 0;; *) return 1;; esac; }
-minutes_list(){ local n="$1" step=$((60/n)) out="" m=0; while [[ $m -lt 60 ]]; do out+="$m,"; m=$((m+step)); done; printf "%s\n" "${out%,}"; }
+
+# FIX: split variable assignments so set -u doesn't complain
+minutes_list(){
+  local n="$1"
+  local step
+  step=$((60 / n))
+  local out=""
+  local m=0
+  while (( m < 60 )); do
+    out+="${m},"
+    m=$((m + step))
+  done
+  printf '%s\n' "${out%,}"
+}
+
 try_setcap_cap_net_raw(){
   local pybin="$1"
   [[ -x "$pybin" ]] || { echo "    - Python binary not found at $pybin (skipping setcap)."; return 1; }
@@ -126,7 +140,12 @@ main(){
   STEP_MIN=$((60 / LPH)); WINDOW_SEC=$((STEP_MIN * 60)); DURATION=$((WINDOW_SEC - SAFETY)); [[ $DURATION -gt 0 ]] || { echo "ERROR: Safety too large."; exit 2; }
   MINUTES="$(minutes_list "$LPH")"
 
-  echo; echo "Schedule (CRON_TZ=$CRON_TZ_VAL):"; echo "  Minute marks: $MINUTES"; echo "  Window seconds: $WINDOW_SEC"; echo "  Duration seconds: $DURATION"; echo
+  echo
+  echo "Schedule (CRON_TZ=$CRON_TZ_VAL):"
+  echo "  Minute marks: $MINUTES"
+  echo "  Window seconds: $WINDOW_SEC"
+  echo "  Duration seconds: $DURATION"
+  echo
 
   echo "[3/12] Preparing install root: $PREFIX"; mkdir -p "$PREFIX"
   echo "[4/12] Cloning/updating repo..."
