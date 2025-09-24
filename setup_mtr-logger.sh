@@ -15,7 +15,7 @@ BRANCH_DEFAULT="main"
 PREFIX_DEFAULT="/opt/mtr-logger"
 WRAPPER_DEFAULT="/usr/local/bin/mtr-logger"
 
-TARGET_DEFAULT="8.8.8.8"
+TARGET_DEFAULT="google.ca"
 PROTO_DEFAULT="icmp"
 DNS_DEFAULT="auto"
 INTERVAL_DEFAULT="0.1"    # CHANGED: was 0.2
