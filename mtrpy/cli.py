@@ -14,11 +14,21 @@ from .util import (
     ResolvedHost,
     ReverseDNSCache,
     default_log_dir,
-    ensure_dir,
     now_local_str,
     resolve_host,
     timestamp_filename,
 )
+
+# ---------------- ASCII logo ----------------
+LOGO = r"""
+         __           .__                                     
+  ______/  |________  |  |   ____   ____   ____   ___________ 
+ /     \   __\_  __ \ |  |  /  _ \ / ___\ / ___\_/ __ \_  __ \
+|  Y Y  \  |  |  | \/ |  |_(  <_> ) /_/  > /_/  >  ___/|  | \/
+|__|_|  /__|  |__|    |____/\____/\___  /\___  / \___  >__|   
+      \/                         /_____//_____/      \/        
+""".rstrip("\n")
+
 
 # ---------------- Data model ----------------
 
@@ -109,16 +119,19 @@ async def mtr_loop(
             tr_path, resolved.ip, max_hops, timeout, proto, probes
         )
 
+        # Update stats
         for ttl, samples in rtts_by_ttl.items():
             addr_raw = addr_by_ttl.get(ttl)
             circuit.update_hop_samples(ttl, addr_raw, samples)
 
+        # Reverse DNS fill-in if requested
         if dns_mode != "off":
             for ttl, hop in list(circuit.hops.items()):
                 if hop.address and hop.address != "*":
                     new_name = await dns_cache.lookup(hop.address)
                     hop.address = new_name or hop.address
 
+        # Generate alerts only when "lost" increases for a hop (and ignore pure "*" hops)
         for ttl, hop in sorted(circuit.hops.items()):
             if ignore_star_hops_for_alerts and (hop.address in (None, "*")):
                 continue
@@ -130,13 +143,18 @@ async def mtr_loop(
                 alerts.append((ttl, hop.address or "*", current_lost, now_local_str()))
 
     def print_frame() -> None:
-        table = build_table(circuit, display_target, circuit.started_at, ascii_mode=ascii_mode, wide=False)
         console.clear()
+        # Top: logo
+        console.print(LOGO)
+        # Table
+        table = build_table(circuit, display_target, circuit.started_at, ascii_mode=ascii_mode, wide=False)
         console.print(table)
+        # Alerts below the summary
         if last_alert_idx < len(alerts):
             for ttl, addr, lost, ts in alerts[last_alert_idx:]:
                 console.print(f"❌ Packet loss detected on hop {ttl} ({addr}) at {ts} - {lost} packets lost")
 
+    # Run
     if duration <= 0:
         try:
             while True:
@@ -196,6 +214,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     except KeyboardInterrupt:
         return 0
 
+    # Interactive run doesn’t export
     if args.duration <= 0:
         return 0
 
