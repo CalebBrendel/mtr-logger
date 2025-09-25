@@ -1,6 +1,19 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# ----------------- Logo -----------------
+print_logo() {
+cat <<'LOGO'
+         __           .__                                     
+  ______/  |________  |  |   ____   ____   ____   ___________ 
+ /     \   __\_  __ \ |  |  /  _ \ / ___\ / ___\_/ __ \_  __ \
+|  Y Y  \  |  |  | \/ |  |_(  <_> ) /_/  > /_/  >  ___/|  | \/
+|__|_|  /__|  |__|    |____/\____/\___  /\___  / \___  >__|   
+      \/                         /_____//_____/      \/        
+LOGO
+}
+# ----------------------------------------
+
 # ----------------- Defaults -----------------
 GIT_URL_DEFAULT="https://github.com/CalebBrendel/mtr-logger.git"
 BRANCH_DEFAULT="main"
@@ -10,8 +23,8 @@ WRAPPER_DEFAULT="/usr/local/bin/mtr-logger"
 TARGET_DEFAULT="google.ca"
 PROTO_DEFAULT="icmp"
 DNS_DEFAULT="auto"
-INTERVAL_DEFAULT="0.1"
-TIMEOUT_DEFAULT="0.2"
+INTERVAL_DEFAULT="0.3"
+TIMEOUT_DEFAULT="0.3"
 PROBES_DEFAULT="3"
 FPS_DEFAULT="6"
 ASCII_DEFAULT="yes"
@@ -108,6 +121,7 @@ detect_current_tz(){
 
 main(){
   require_root
+  print_logo
   echo "== mtr-logger bootstrap (universal) =="
 
   PM="$(detect_pm)"; [[ "$PM" != "none" ]] || { echo "No supported package manager found."; exit 1; }
@@ -204,6 +218,7 @@ ${MINUTES} * * * * TZ=\"$CRON_TZ_VAL\" flock -n /var/run/mtr-logger.lock $WRAPPE
   echo "    - Cron jobs scheduled with CRON_TZ=$CRON_TZ_VAL"
 
   echo "[12/12] Done."
+  print_logo
   cat <<INFO
 
 ✅ Install complete.
@@ -225,4 +240,4 @@ Notes:
 INFO
 }
 
-main "$@"
+main "$@" 
