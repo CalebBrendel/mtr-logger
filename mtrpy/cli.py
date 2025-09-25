@@ -84,9 +84,9 @@ async def mtr_loop(
     target: str,
     *,
     proto: str = "icmp",
-    interval: float = 0.1,
+    interval: float = 0.3,
     probes: int = 3,
-    timeout: float = 0.2,
+    timeout: float = 0.3,
     duration: int = 0,                # 0 => continuous interactive
     ascii_mode: bool = False,
     dns_mode: str = "auto",           # auto|on|off
@@ -180,9 +180,9 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="mtr-logger", description="Fast MTR-style path monitor/logger.")
     p.add_argument("target", help="Target hostname or IP (e.g., google.ca)")
     p.add_argument("--proto", choices=["icmp", "tcp", "udp"], default="icmp")
-    p.add_argument("-i", "--interval", type=float, default=0.1, help="Interval between rounds (s)")
+    p.add_argument("-i", "--interval", type=float, default=0.3, help="Interval between rounds (s)")
     p.add_argument("-p", "--probes", type=int, default=3, help="Probes per hop per round")
-    p.add_argument("--timeout", type=float, default=0.2, help="Per-probe timeout (s)")
+    p.add_argument("--timeout", type=float, default=0.3, help="Per-probe timeout (s)")
     p.add_argument("--duration", type=int, default=0, help="Seconds to run; 0 = interactive continuous")
     p.add_argument("--dns", choices=["auto", "on", "off"], default="auto", help="Reverse DNS policy")
     p.add_argument("--ascii", action="store_true", help="Use ASCII borders in TUI")
