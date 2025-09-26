@@ -40,7 +40,7 @@ sanitize_input() {
 }
 is_valid_git_url(){ case "${1:-}" in https://*|git@*:* ) return 0;; *) return 1;; esac; }
 ask(){ local l="$1" d="$2" a=""; if [[ -t 0 ]]; then read -r -p "$l [$d]: " a; else read -r -p "$l [$d]: " a < /dev/tty; fi; a="$(printf "%s" "${a:-$d}"|sanitize_input)"; printf "%s\n" "$a"; }
-ask_yn(){ local l="$1" d="${2:-Y}" a=""; read -r -p "$l [${d}]: " a || true; a="$(printf "%s" "${a:-$d}"|sanitize_input)"; case "$a" in [Yy]|[Yy][Ee][Ss]) echo "Y";; [Nn]|[Nn][Oo]) echo "N";; *) echo "$d";; esac; }
+ask_yn(){ local l="$1" d="${2:-Y}" a=""; if [[ -t 0 ]]; then read -r -p "$l [${d}]: " a; else read -r -p "$l [${d}]: " a < /dev/tty; fi; a="$(printf "%s" "${a:-$d}"|sanitize_input)"; case "$a" in [Yy]|[Yy][Ee][Ss]) echo "Y";; [Nn]|[Nn][Oo]) echo "N";; *) echo "$d";; esac; }
 require_root(){ [[ ${EUID:-$(id -u)} -eq 0 ]] || { echo "Please run as root (sudo)."; exit 1; }; }
 
 detect_pm(){
@@ -113,13 +113,9 @@ detect_current_tz(){
   [[ -f /etc/timezone ]] && { tr -d '\n\r' < /etc/timezone; echo; return; }
   echo "Etc/UTC"
 }
-current_time_in_tz(){
-  local tz="$1"
-  TZ="$tz" date "+%Y-%m-%d %H:%M:%S (%Z)"
-}
+current_time_in_tz(){ local tz="$1"; TZ="$tz" date "+%Y-%m-%d %H:%M:%S (%Z)"; }
 
 _collect_timezones(){
-  # Prefer tzdata list if present; otherwise walk zoneinfo
   if command -v timedatectl >/dev/null 2>&1; then
     timedatectl list-timezones 2>/dev/null || true
     return
@@ -146,7 +142,6 @@ tz_wizard_apply(){
       return 0
     fi
   fi
-  # Fallback symlink for non-systemd
   if [[ -f "/usr/share/zoneinfo/${tz}" ]]; then
     ln -sf "/usr/share/zoneinfo/${tz}" /etc/localtime
     echo "${tz}" >/etc/timezone || true
@@ -173,7 +168,6 @@ tz_wizard(){
     return 0
   fi
 
-  # Load list once
   mapfile -t ALL_TZ < <(_collect_timezones)
   if [[ "${#ALL_TZ[@]}" -eq 0 ]]; then
     echo "  - Could not enumerate timezones. You can enter an exact IANA name next."
@@ -182,25 +176,22 @@ tz_wizard(){
   while true; do
     echo
     cat <<MENU
-Browse/search, or enter exactly (examples: America/Chicago, Europe/Berlin)
+Timezone options:
+  1) Browse by region (continents)
+  2) Search by keyword (city/region substring)
+  3) Enter exact IANA timezone (e.g., America/Chicago)
+  4) Keep current timezone (${detected})
+  5) Cancel timezone change
 
-[1] Browse by region (continents)
-[2] Search by keyword (city/region substring)
-[3] Enter exact IANA timezone
-[4] Keep current timezone (${detected})
-[5] Cancel timezone change
-
-Type 1-5 and press Enter.
+Type 1, 2, 3, 4, or 5 and press Enter.
 MENU
     read -r -p "Choose an option [4]: " opt_raw || true
     opt_raw="$(printf "%s" "${opt_raw:-4}" | sanitize_input)"
 
     case "$opt_raw" in
       1)
-        # Regions are the first path element before '/'
         mapfile -t REGIONS < <(printf '%s\n' "${ALL_TZ[@]}" | awk -F/ 'NF>1{print $1}' | sort -u)
-        echo
-        echo "Regions:"
+        echo; echo "Regions:"
         local idx=1
         for r in "${REGIONS[@]}"; do printf "  %2d) %s\n" "$idx" "$r"; idx=$((idx+1)); done
         read -r -p "Pick a region by number or name (e.g., 1 or America): " pick || true
@@ -211,22 +202,18 @@ MENU
         else
           region="$pick"
         fi
-        if [[ -z "$region" ]]; then echo "  - No region chosen."; continue; fi
+        [[ -z "$region" ]] && { echo "  - No region chosen."; continue; }
 
         mapfile -t ZONES_IN_REGION < <(printf '%s\n' "${ALL_TZ[@]}" | awk -F/ -v r="$region" 'index($0, r"/")==1')
-        if [[ "${#ZONES_IN_REGION[@]}" -eq 0 ]]; then
-          echo "  - No zones found under region '${region}'."
-          continue
-        fi
-        echo
-        echo "Zones in ${region}:"
+        if [[ "${#ZONES_IN_REGION[@]}" -eq 0 ]]; then echo "  - No zones under '${region}'."; continue; fi
+        echo; echo "Zones in ${region}:"
         idx=1
         for z in "${ZONES_IN_REGION[@]}"; do
           printf "  %2d) %s\n" "$idx" "$z"
           (( idx>=30 )) && { echo "  ... (showing first 30)"; break; }
           idx=$((idx+1))
         done
-        read -r -p "Enter number (1-${idx-1}) or exact zone (e.g., ${region}/Chicago): " zp || true
+        read -r -p "Enter number (1-$((idx-1))) or exact zone (e.g., ${region}/Chicago): " zp || true
         zp="$(sanitize_input <<<"${zp:-}")"
         local chosen=""
         if [[ "$zp" =~ ^[0-9]+$ ]] && (( zp>=1 && zp<idx )); then
@@ -234,22 +221,16 @@ MENU
         else
           chosen="$zp"
         fi
-        if [[ -n "$chosen" ]]; then
-          tz_wizard_apply "$chosen" && { echo "$chosen"; return 0; }
-        fi
+        [[ -n "$chosen" ]] && tz_wizard_apply "$chosen" && { echo "$chosen"; return 0; }
         ;;
 
       2)
         read -r -p "Search keyword (e.g., Chicago or Berlin) []: " kw || true
         kw="$(sanitize_input <<<"${kw:-}")"
-        if [[ -z "$kw" ]]; then echo "  - No keyword entered."; continue; fi
+        [[ -z "$kw" ]] && { echo "  - No keyword entered."; continue; }
         mapfile -t MATCHES < <(printf '%s\n' "${ALL_TZ[@]}" | grep -i -- "$kw" | head -n 30)
-        if [[ "${#MATCHES[@]}" -eq 0 ]]; then
-          echo "  - No matches for '$kw'. Try another keyword."
-          continue
-        fi
-        echo
-        echo "Matches (pick by number or type exact name):"
+        if [[ "${#MATCHES[@]}" -eq 0 ]]; then echo "  - No matches for '$kw'."; continue; fi
+        echo; echo "Matches (pick by number or type exact name):"
         idx=1
         for m in "${MATCHES[@]}"; do printf "  %2d) %s\n" "$idx" "$m"; idx=$((idx+1)); done
         read -r -p "Your choice: " mm || true
@@ -260,9 +241,7 @@ MENU
         else
           chosen="$mm"
         fi
-        if [[ -n "$chosen" ]]; then
-          tz_wizard_apply "$chosen" && { echo "$chosen"; return 0; }
-        fi
+        [[ -n "$chosen" ]] && tz_wizard_apply "$chosen" && { echo "$chosen"; return 0; }
         ;;
 
       3)
@@ -300,11 +279,11 @@ main(){
   install_deps "$PM"
   start_cron_service
 
-  # --- Timezone wizard (clear menu + previews) ---
+  # ---- TIMEZONE WIZARD FIRST ----
   CURRENT_TZ="$(detect_current_tz)"
   CRON_TZ_VAL="$(tz_wizard "$CURRENT_TZ")"
 
-  # --- Regular prompts ---
+  # ---- THEN the normal prompts / clone/install ----
   GIT_URL="$(ask "Git URL" "$GIT_URL_DEFAULT")"; is_valid_git_url "$GIT_URL" || { echo "WARNING: invalid URL; using default."; GIT_URL="$GIT_URL_DEFAULT"; }
   BRANCH="$(ask "Branch" "$BRANCH_DEFAULT")"
   PREFIX="$(ask "Install prefix" "$PREFIX_DEFAULT")"
