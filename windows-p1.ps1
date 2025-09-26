@@ -1,9 +1,10 @@
 <#  windows-onefile.ps1 — One-command Windows installer for mtr-logger (PowerShell 5.1+)
-    v7.1 (this file):
-      - FIX: schtasks /TR argument now passed as a single quoted token
-      - Keeps: traceroute shim (uses tracert & prints traceroute-like lines)
-      - Keeps: EXE-first Python install; fallback to embeddable ZIP + pip bootstrap
-      - Keeps: PATH refresh for current session so `mtr-logger` works immediately
+    v7.2:
+      - schtasks /TR token passed as ONE quoted string via cmd.exe /d /c
+      - Python traceroute shim (parses tracert → prints traceroute-like lines)
+      - Force asyncio.WindowsSelectorEventLoopPolicy via .pth (silences “Event loop is closed” on Windows)
+      - EXE-first Python install; embeddable ZIP fallback with pip bootstrap
+      - PATH refresh for current session; immediate mtr-logger availability
 #>
 
 $ErrorActionPreference = 'Stop'
@@ -142,8 +143,8 @@ function Ensure-Choco {
   }
 }
 function Ensure-GitCurl {
-  choco install -y --no-progress git
-  choco install -y --no-progress curl
+  choco install -y --no-progress git | Out-Null
+  choco install -y --no-progress curl | Out-Null
   Refresh-Path
 }
 
@@ -196,7 +197,7 @@ function Install-Python-Embeddable {
     Set-Content -Path $pth -Value $content -Encoding ASCII
   }
 
-  # Bootstrap pip (no Start-Process; let errors surface)
+  # Bootstrap pip
   Write-Host "Bootstrapping pip inside embeddable..."
   $getpip = Join-Path $env:TEMP ("get-pip-"+[guid]::NewGuid().ToString()+".py")
   Invoke-WebRequest -UseBasicParsing -Uri $GET_PIP_URL -OutFile $getpip
@@ -204,13 +205,10 @@ function Install-Python-Embeddable {
   & $pyexe $getpip --no-warn-script-location
   try { Remove-Item $getpip -Force } catch {}
 
-  # Verify pip actually installed
   & $pyexe -m pip --version
   if ($LASTEXITCODE -ne 0) { throw "pip did not install correctly in embeddable runtime." }
 
-  # Quietly ensure wheel
   & $pyexe -m pip install -U pip wheel --no-warn-script-location | Out-Null
-
   return $pyexe
 }
 
@@ -287,7 +285,6 @@ choco install -y --no-progress curl | Out-Null
 Refresh-Path
 
 Write-Host "[3/12] Installing Python..."
-# Try EXE first; fallback to embeddable if not resolvable
 $exeRes = Install-Python-EXE
 $PYEXE = $null
 if ($exeRes.Path) {
@@ -404,6 +401,7 @@ if (Test-Path "$WRAPPER_CMD") { Remove-Item -Force "$WRAPPER_CMD" }
 if (Test-Path "$WRAPPER_PS")  { Remove-Item -Force "$WRAPPER_PS" }
 if (Test-Path (Join-Path "$BIN_DIR" "traceroute.cmd")) { Remove-Item -Force (Join-Path "$BIN_DIR" "traceroute.cmd") }
 if (Test-Path (Join-Path "$BIN_DIR" "traceroute.ps1")) { Remove-Item -Force (Join-Path "$BIN_DIR" "traceroute.ps1") }
+if (Test-Path (Join-Path "$BIN_DIR" "traceroute.py"))  { Remove-Item -Force (Join-Path "$BIN_DIR" "traceroute.py") }
 
 Write-Host "[4/5] (Optional) Remove logs at `$env:USERPROFILE\mtr\logs"
 `$del = Read-Host "Delete logs as well? [y/N]"
@@ -422,6 +420,10 @@ if (`$Args.Count -gt 0 -and `$Args[0].ToString().ToLower() -eq 'uninstall') {
   & "$UNINSTALL_PS"
   exit `$LASTEXITCODE
 }
+# Force Selector loop on Windows in case mtrpy does not import site fast enough
+try {
+  import-module -Name Microsoft.PowerShell.Management -ErrorAction SilentlyContinue | Out-Null
+} catch {}
 & "$RUN_PY" -m mtrpy @Args
 "@ | Set-Content -Encoding UTF8 $WRAPPER_PS
 
@@ -436,73 +438,112 @@ powershell -NoProfile -ExecutionPolicy Bypass -Command ^
   "& `"$WRAPPER_PS`" %*"
 "@ | Set-Content -Encoding OEM $WRAPPER_CMD
 
-# --- traceroute shim (parse tracert → print Linux-like traceroute) ---
-@'
-param([string[]]$Args)
+# --- traceroute shim (Python → tracert.exe → linux-like output) ---
+$trPy = @'
+import re, subprocess, sys, os
 
-# Defaults
-$dest     = $null
-$numeric  = $false    # -n -> tracert -d
-$maxhops  = $null     # -m X -> tracert -h X
-$timeoutS = $null     # -w S -> tracert -w ms
+def main(argv):
+    dest = None
+    numeric = False
+    maxhops = None
+    timeout_s = None
 
-# Parse minimal options
-for ($i=0; $i -lt $Args.Count; $i++) {
-  $a = $Args[$i]
-  switch ($a) {
-    '-n' { $numeric = $true }
-    '-m' { if ($i + 1 -lt $Args.Count) { $maxhops = [int]$Args[++$i] } }
-    '-w' { if ($i + 1 -lt $Args.Count) { $timeoutS = [double]$Args[++$i] } }
-    default { if ($a -notmatch '^-') { $dest = $a } }
-  }
-}
-if (-not $dest) { Write-Error "Usage: traceroute <host>"; exit 1 }
+    it = iter(argv)
+    for a in it:
+        if a == "-n":
+            numeric = True
+        elif a == "-m":
+            try: maxhops = int(next(it))
+            except StopIteration: pass
+        elif a == "-w":
+            try: timeout_s = float(next(it))
+            except StopIteration: pass
+        elif a.startswith("-"):
+            continue
+        else:
+            dest = a
 
-$trArgs = @()
-if ($numeric)    { $trArgs += '-d' }
-if ($maxhops)    { $trArgs += @('-h', [int]$maxhops) }
-if ($timeoutS)   { $trArgs += @('-w', ([int][Math]::Ceiling($timeoutS * 1000))) }
-$trArgs += $dest
+    if not dest:
+        print("Usage: traceroute <host>", file=sys.stderr)
+        return 1
 
-# Run tracert
-$lines = & "$env:SystemRoot\System32\tracert.exe" @trArgs 2>&1
+    tr = os.path.join(os.environ.get("SystemRoot", r"C:\Windows"), "System32", "tracert.exe")
+    if not os.path.exists(tr):
+        print("tracert.exe not found", file=sys.stderr)
+        return 1
 
-# Print Linux-like header
-"traceroute to $dest, using Windows tracert"
+    args = [tr]
+    if numeric: args.append("-d")
+    if maxhops: args += ["-h", str(int(maxhops))]
+    if timeout_s: args += ["-w", str(int(round(timeout_s*1000)))]
+    args.append(dest)
 
-# Parse each hop line like:
-#   "  1    <1 ms   2 ms   3 ms  10.0.0.1"
-#   "  2     *       *      *    Request timed out."
-$hop = 0
-foreach ($ln in $lines) {
-  if ($ln -match '^\s*(\d+)\s+(.+)$') {
-    $hop = [int]$matches[1]
-    $rest = $matches[2]
+    cp = subprocess.run(args, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, encoding="utf-8", errors="replace")
 
-    # Normalize "<1 ms" → "1 ms"
-    $rest = $rest -replace '<\s*1\s*ms','1 ms'
+    print(f"traceroute to {dest}, using Windows tracert")
+    hop_re = re.compile(r"^\s*(\d+)\s+(.+)$")
+    for line in cp.stdout.splitlines():
+        m = hop_re.match(line)
+        if not m:
+            continue
+        hop = int(m.group(1))
+        rest = m.group(2).replace("< 1 ms", "1 ms").replace("<1 ms","1 ms")
+        if "Request timed out" in rest:
+            print(f"{hop:2d}  *  *  *")
+            continue
+        rtts = [int(x) for x in re.findall(r"(\\d+)\\s*ms", rest)]
+        ips  = re.findall(r"(\\d{1,3}(?:\\.\\d{1,3}){3})", rest)
+        ip = ips[-1] if ips else "???"
+        if not rtts:
+            print(f"{hop:2d}  {ip}  *  *  *")
+        else:
+            print(f"{hop:2d}  {ip}  " + "  ".join(f"{v} ms" for v in rtts[:3]))
+    return cp.returncode
 
-    if ($rest -match 'Request timed out') {
-      "{0,2}  *  *  *" -f $hop
-      continue
-    }
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))
+'@
+Set-Content -Encoding UTF8 (Join-Path $BIN_DIR "traceroute.py") $trPy
 
-    $rtts = @()
-    [regex]::Matches($rest, '(\d+)\s*ms') | ForEach-Object { $rtts += [int]$_.Groups[1].Value }
-    $ipMatch = [regex]::Matches($rest, '(\d{1,3}(\.\d{1,3}){3})')
-    $ip = if ($ipMatch.Count -gt 0) { $ipMatch[$ipMatch.Count-1].Groups[1].Value } else { "???" }
-    if ($rtts.Count -eq 0) { $rtts = @('*','*','*') }
-    $rttText = ($rtts | ForEach-Object { if ($_ -is [int]) { "{0} ms" -f $_ } else { "*" } }) -join "  "
-    "{0,2}  {1}  {2}" -f $hop, $ip, $rttText
-  }
-}
-exit $LASTEXITCODE
-'@ | Set-Content -Encoding UTF8 (Join-Path $BIN_DIR "traceroute.ps1")
-
-@'
+# traceroute.cmd chooses venv python first, then embeddable
+$trCmd = @'
 @echo off
-powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0traceroute.ps1" %*
-'@ | Set-Content -Encoding ASCII (Join-Path $BIN_DIR "traceroute.cmd")
+setlocal
+set VENV_PY=%~dp0..\ .venv\Scripts\python.exe
+set VENV_PY=%VENV_PY:..\ .venv=..\ .venv%
+set VENV_PY=%VENV_PY: =%
+if exist "%VENV_PY%" (
+  "%VENV_PY%" "%~dp0traceroute.py" %* 2>&1
+  exit /b %ERRORLEVEL%
+)
+if exist "%~dp0..\pyembed\python.exe" (
+  "%~dp0..\pyembed\python.exe" "%~dp0traceroute.py" %* 2>&1
+  exit /b %ERRORLEVEL%
+)
+echo Python not found for traceroute shim 1>&2
+exit /b 1
+'@
+Set-Content -Encoding ASCII (Join-Path $BIN_DIR "traceroute.cmd") $trCmd
+
+# --- Force Selector event loop via .pth ---
+# install to venv site-packages, or embeddable Lib\site-packages
+$site = $null
+try { $site = & $RUN_PY -c "import site,sys;print((site.getsitepackages() or [sys.prefix])[0])" } catch {}
+if (-not $site -or -not (Test-Path $site)) {
+  $site = Join-Path (Split-Path $RUN_PY -Parent) "Lib\site-packages"
+  Ensure-Dir $site
+}
+$mod = @'
+import sys
+if sys.platform.startswith("win"):
+    try:
+        import asyncio
+        asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
+    except Exception:
+        pass
+'@
+Set-Content -Encoding UTF8 (Join-Path $site "win_asyncio_policy.py") $mod
+Set-Content -Encoding ASCII (Join-Path $site "zzz_win_asyncio_policy.pth") "import win_asyncio_policy"
 
 Write-Host "[10/12] Ensuring $BIN_DIR on system PATH..."
 $curPath = [Environment]::GetEnvironmentVariable("Path","Machine")
@@ -524,7 +565,7 @@ $stepMin = [int](60 / $LPH)
 $windowSec = $stepMin * 60
 $duration = $windowSec - $SAFETY
 
-# Build /TR lines; then Task-Create will add outer quotes and cmd.exe /c
+# Build /TR inner command; Task-Create wraps with cmd.exe /d /c and quotes once
 $logInner = """$WRAPPER_CMD"" ""$TARGET"" --proto ""$PROTO"" --dns ""$DNS_MODE"" -i ""$INTERVAL"" --timeout ""$TIMEOUT"" -p ""$PROBES"" --duration $duration --export --outfile auto >> ""$logOut"" 2>&1"
 Task-Create -Name $MAIN_TASK -CmdLine $logInner -Schedule "MINUTE" -Mo "$stepMin"
 
@@ -545,7 +586,7 @@ try {
 
 Write-Host ""
 Write-Host "✅ Install complete."
-Write-Host "You can run NOW (no new terminal needed):"
-Write-Host "  mtr-logger $TARGET --proto $PROTO -i $INTERVAL --timeout $TIMEOUT -p $PROBES"
+Write-Host "Try interactive NOW (no new terminal needed):"
+Write-Host "  mtr-logger $TARGET --proto tcp"
 Write-Host "Uninstall anytime:  mtr-logger uninstall"
 Write-Host "Logs: $LOG_DIR"
