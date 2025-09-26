@@ -438,7 +438,7 @@ ${MINUTES} * * * * TZ=\"$CRON_TZ_VAL\" flock -n /var/run/mtr-logger.lock $WRAPPE
   print_logo
   cat <<INFO
 
-✅ Install complete.
+✅ Install complete, nerd! Big Chungus sends his regards!🐰🥕
 
 Run interactively:
   mtr-logger $TARGET --proto $PROTO -i $INTERVAL --timeout $TIMEOUT -p $PROBES ${ASCII_FLAG:+$ASCII_FLAG} ${SCREEN_FLAG:+$SCREEN_FLAG}
