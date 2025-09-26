@@ -1,8 +1,9 @@
 <#  windows-onefile.ps1 — One-command Windows installer for mtr-logger (PowerShell 5.1)
-    Changes in this build:
-      * Python EXE install: try All-Users first, then Per-User fallback
-      * Include launcher explicitly; force PATH prepend
-      * Aggressive resolution of python.exe across known locations
+    v3: Python install is now bullet-proof:
+      - All-Users then Per-User EXE
+      - Remove WindowsApps stubs
+      - Resolve via py launcher, registry, known paths, then quick scan
+      - /log PythonInstall.log and show tail on failure
 #>
 
 $ErrorActionPreference = 'Stop'
@@ -67,26 +68,69 @@ function Remove-StorePythonStubs {
     $p = Join-Path $wa $s; if (Test-Path $p) { try { Remove-Item -Force $p } catch {} }
   }
 }
+
+# --- Python resolvers ---
+function Resolve-Python-FromRegistry {
+  $keys = @(
+    "HKLM:\SOFTWARE\Python\PythonCore",
+    "HKLM:\SOFTWARE\WOW6432Node\Python\PythonCore",
+    "HKCU:\SOFTWARE\Python\PythonCore"
+  )
+  $cands = @()
+  foreach($root in $keys){
+    try {
+      if(Test-Path $root){
+        Get-ChildItem $root -ErrorAction Stop | ForEach-Object {
+          $verKey = $_.PSPath
+          try {
+            $ip = Join-Path $verKey "InstallPath"
+            if(Test-Path $ip){
+              $path = (Get-ItemProperty -Path $ip -Name "(default)" -ErrorAction SilentlyContinue)."(default)"
+              if($path -and (Test-Path (Join-Path $path "python.exe"))){
+                $cands += (Join-Path $path "python.exe")
+              }
+            }
+          } catch {}
+        }
+      }
+    } catch {}
+  }
+  # choose highest version by folder name heuristic
+  $best = $cands | Sort-Object -Descending -Unique | Select-Object -First 1
+  return $best
+}
+
 function Resolve-Python {
-  # 1) Preferred: py launcher
+  # 1) py launcher
   try {
     Get-Command py -ErrorAction Stop | Out-Null
     $p = & py -3 -c "import sys,os;print(sys.executable if os.path.exists(sys.executable) else '')" 2>$null
     if ($p) { $p=$p.Trim(); if (Test-Path $p) { return $p } }
   } catch {}
-
-  # 2) Probe canonical locations
+  # 2) Registry
+  $reg = Resolve-Python-FromRegistry
+  if($reg){ return $reg }
+  # 3) Known locations
   $cands=@(
     "C:\Program Files\Python313\python.exe","C:\Program Files\Python312\python.exe","C:\Program Files\Python311\python.exe","C:\Program Files\Python310\python.exe",
     "C:\Python313\python.exe","C:\Python312\python.exe","C:\Python311\python.exe","C:\Python310\python.exe",
     "$env:LOCALAPPDATA\Programs\Python\Python313\python.exe","$env:LOCALAPPDATA\Programs\Python\Python312\python.exe","$env:LOCALAPPDATA\Programs\Python\Python311\python.exe","$env:LOCALAPPDATA\Programs\Python\Python310\python.exe"
   )
   foreach ($c in $cands) { if (Test-Path $c) { return $c } }
-
-  # 3) PATH (only if real file)
+  # 4) Quick scan (bounded)
+  foreach($root in @("C:\Program Files","C:\Program Files (x86)", (Join-Path $env:LOCALAPPDATA "Programs\Python"))){
+    try {
+      if(Test-Path $root){
+        $hit = Get-ChildItem -Path $root -Recurse -ErrorAction SilentlyContinue -Filter python.exe -File | Select-Object -First 1
+        if($hit){ return $hit.FullName }
+      }
+    } catch {}
+  }
+  # 5) PATH (real file only)
   try { $pc=Get-Command python -ErrorAction Stop; if($pc.Source -and (Test-Path $pc.Source)){ return $pc.Source } } catch {}
   return $null
 }
+
 function Check-PyVersion([string]$PyExe, [version]$MinVersion = [version]"3.8") {
   $v = & $PyExe -c "import sys;print('.'.join(map(str,sys.version_info[:3])))"
   $v = ($v | Select-Object -First 1).Trim()
@@ -94,6 +138,8 @@ function Check-PyVersion([string]$PyExe, [version]$MinVersion = [version]"3.8") 
   if ([version]$v -lt $MinVersion) { throw "Python $v is below required minimum $MinVersion" }
   return $true
 }
+
+# ----------------- Chocolatey + deps -----------------
 function Ensure-Choco {
   if (-not (Get-Command choco.exe -ErrorAction SilentlyContinue)) {
     Write-Host "Installing Chocolatey..."
@@ -109,35 +155,38 @@ function Ensure-GitCurl {
   Refresh-Path
 }
 
-# --- Install Python via EXE: All-Users, then Per-User fallback ---
+# --- Install Python via EXE with logging and fallback ---
 function Ensure-PythonDirect {
   Remove-StorePythonStubs
   Refresh-Path
 
-  # Already present?
   $existing = Resolve-Python
   if ($existing) { return $existing }
 
   $tmp = Join-Path $env:TEMP ("python-"+$PY_VERSION+"-"+[guid]::NewGuid().ToString()+".exe")
+  $log = Join-Path $env:TEMP ("PythonInstall-"+(Get-Date -Format "yyyyMMdd-HHmmss")+".log")
   Write-Host "Downloading Python $PY_VERSION ..."
   Invoke-WebRequest -UseBasicParsing -Uri $PY_EXE_URL -OutFile $tmp
 
-  # Try All-Users first (Program Files)
+  # All-Users first
   Write-Host "Installing Python (All-Users, silent)..."
-  $args = "/quiet InstallAllUsers=1 PrependPath=1 Include_test=0 Include_launcher=1 InstallLauncherAllUsers=1"
-  Start-Process $tmp -ArgumentList $args -Wait
+  $argsAU = "/quiet InstallAllUsers=1 PrependPath=1 Include_test=0 Include_launcher=1 InstallLauncherAllUsers=1 /log `"$log`""
+  Start-Process $tmp -ArgumentList $argsAU -Wait
   Refresh-Path; Start-Sleep -Seconds 2
   $py = Resolve-Python
   if ($py) { try { Remove-Item $tmp -Force } catch {}; return $py }
 
-  # Fallback: Per-User install (LocalAppData)
+  # Per-User fallback
   Write-Host "All-Users install not visible; retrying Per-User install..."
-  $argsPU = "/quiet InstallAllUsers=0 PrependPath=1 Include_test=0 Include_launcher=1"
+  $argsPU = "/quiet InstallAllUsers=0 PrependPath=1 Include_test=0 Include_launcher=1 /log `"$log`""
   Start-Process $tmp -ArgumentList $argsPU -Wait
   Refresh-Path; Start-Sleep -Seconds 2
   $py = Resolve-Python
   try { Remove-Item $tmp -Force } catch {}
+
   if (-not $py) {
+    Write-Host "Python installer log (tail): $log" -ForegroundColor Yellow
+    try { Get-Content -Path $log -Tail 60 | ForEach-Object { Write-Host "  $_" } } catch {}
     throw "Python installation completed but python.exe not resolvable to this session."
   }
   return $py
@@ -298,7 +347,6 @@ Ensure-Dir $LOG_DIR
 $logOut = Join-Path $env:USERPROFILE "mtr-logger.log"
 $archOut= Join-Path $env:USERPROFILE "mtr-logger-archive.log"
 
-$stepMin = [int](60 / $LPH)
 $logCmd = "`"$WRAPPER_CMD`" `"$TARGET`" --proto `"$PROTO`" --dns `"$DNS_MODE`" -i `"$INTERVAL`" --timeout `"$TIMEOUT`" -p `"$PROBES`" --duration $duration --export --outfile auto >> `"$logOut`" 2>&1"
 schtasks /Delete /TN "$MAIN_TASK" /F 2>$null | Out-Null
 schtasks /Create /TN "$MAIN_TASK" /TR $logCmd /SC MINUTE /MO $stepMin /RU "SYSTEM" /RL HIGHEST /F | Out-Null
@@ -307,7 +355,6 @@ $archCmd = "`"$VENV_PY`" -m mtrpy.archiver --retention $ARCHIVE_RETENTION_DEFAUL
 schtasks /Delete /TN "$ARCH_TASK" /F 2>$null | Out-Null
 schtasks /Create /TN "$ARCH_TASK" /TR $archCmd /SC DAILY /ST 00:00 /RU "SYSTEM" /RL HIGHEST /F | Out-Null
 
-# Self-test
 Write-Host "[12/12] Self-test..."
 try {
   & $WRAPPER_CMD $TARGET --proto $PROTO --dns $DNS_MODE -i $INTERVAL --timeout $TIMEOUT -p $PROBES --duration 5 --export --outfile auto | Out-Null
