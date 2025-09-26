@@ -5,7 +5,9 @@
 </details>
 <details>
   <summary>Windows</summary>
-  Test
+  Quick one-line install: 
+  
+  irm https://calebbrendel.com/mtr-logger/windows | iex
 </details>
 
 <details>
