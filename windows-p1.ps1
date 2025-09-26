@@ -1,9 +1,9 @@
 <#  windows-onefile.ps1 — One-command Windows installer for mtr-logger (PowerShell 5.1+)
-    v7.0:
-      - FIX: Scheduled Tasks quoting via cmd.exe /d /c wrapper
-      - FIX: traceroute shim now parses tracert.exe and prints Linux-like traceroute lines
-      - PATH refresh for current session so wrapper works immediately
-      - EXE-first Python install; fallback to embeddable ZIP + robust pip bootstrap
+    v7.1 (this file):
+      - FIX: schtasks /TR argument now passed as a single quoted token
+      - Keeps: traceroute shim (uses tracert & prints traceroute-like lines)
+      - Keeps: EXE-first Python install; fallback to embeddable ZIP + pip bootstrap
+      - Keeps: PATH refresh for current session so `mtr-logger` works immediately
 #>
 
 $ErrorActionPreference = 'Stop'
@@ -251,12 +251,13 @@ function Task-Delete-IfExists([string]$Name) {
   }
 }
 function Task-Create([string]$Name, [string]$CmdLine, [string]$Schedule, [string]$Mo = "", [string]$StartTime = "") {
-  # Wrap with cmd.exe to support redirection and complex quoting in /TR
+  # Wrap with cmd.exe and pass ENTIRE /TR as a single quoted token
   $Wrapped = "cmd.exe /d /c " + $CmdLine
-  $common = @("/Create","/TN",$Name,"/TR",$Wrapped,"/RU","SYSTEM","/RL","HIGHEST","/F","/SC",$Schedule)
-  if ($Mo)       { $common += @("/MO",$Mo) }
-  if ($StartTime){ $common += @("/ST",$StartTime) }
-  Start-Process -FilePath schtasks.exe -ArgumentList $common -NoNewWindow -Wait
+  $WrappedQuoted = '"' + $Wrapped + '"'
+  $args = @("/Create","/TN",$Name,"/TR",$WrappedQuoted,"/RU","SYSTEM","/RL","HIGHEST","/F","/SC",$Schedule)
+  if ($Mo)       { $args += @("/MO",$Mo) }
+  if ($StartTime){ $args += @("/ST",$StartTime) }
+  Start-Process -FilePath schtasks.exe -ArgumentList $args -NoNewWindow -Wait
 }
 
 # ----------------- Main flow -----------------
@@ -286,6 +287,7 @@ choco install -y --no-progress curl | Out-Null
 Refresh-Path
 
 Write-Host "[3/12] Installing Python..."
+# Try EXE first; fallback to embeddable if not resolvable
 $exeRes = Install-Python-EXE
 $PYEXE = $null
 if ($exeRes.Path) {
@@ -477,32 +479,19 @@ foreach ($ln in $lines) {
     $hop = [int]$matches[1]
     $rest = $matches[2]
 
-    # Get RTT tokens and endpoint/IP
-    $rtts = @()
-    $ip   = $null
-
-    # Replace "<1 ms" with "1 ms" for simplicity
+    # Normalize "<1 ms" → "1 ms"
     $rest = $rest -replace '<\s*1\s*ms','1 ms'
 
-    # If timed out
     if ($rest -match 'Request timed out') {
-      # print: "* * *"
       "{0,2}  *  *  *" -f $hop
       continue
     }
 
-    # Extract up to three RTT values like "12 ms"
-    $rttMatches = [regex]::Matches($rest, '(\d+)\s*ms')
-    foreach ($m in $rttMatches) { $rtts += ([int]$m.Groups[1].Value) }
-
-    # Extract last IPv4 (best effort); if not found, show token
+    $rtts = @()
+    [regex]::Matches($rest, '(\d+)\s*ms') | ForEach-Object { $rtts += [int]$_.Groups[1].Value }
     $ipMatch = [regex]::Matches($rest, '(\d{1,3}(\.\d{1,3}){3})')
-    if ($ipMatch.Count -gt 0) { $ip = $ipMatch[$ipMatch.Count-1].Groups[1].Value }
-
-    if (-not $ip) { $ip = "???" }
+    $ip = if ($ipMatch.Count -gt 0) { $ipMatch[$ipMatch.Count-1].Groups[1].Value } else { "???" }
     if ($rtts.Count -eq 0) { $rtts = @('*','*','*') }
-
-    # Print linux-ish: " 1  10.0.0.1  1.0 ms  2.0 ms  3.0 ms"
     $rttText = ($rtts | ForEach-Object { if ($_ -is [int]) { "{0} ms" -f $_ } else { "*" } }) -join "  "
     "{0,2}  {1}  {2}" -f $hop, $ip, $rttText
   }
@@ -531,11 +520,11 @@ $archOut= Join-Path $env:USERPROFILE "mtr-logger-archive.log"
 Task-Delete-IfExists $MAIN_TASK
 Task-Delete-IfExists $ARCH_TASK
 
-# Build properly quoted /TR lines; note double quotes inside the outer quotes
 $stepMin = [int](60 / $LPH)
 $windowSec = $stepMin * 60
 $duration = $windowSec - $SAFETY
 
+# Build /TR lines; then Task-Create will add outer quotes and cmd.exe /c
 $logInner = """$WRAPPER_CMD"" ""$TARGET"" --proto ""$PROTO"" --dns ""$DNS_MODE"" -i ""$INTERVAL"" --timeout ""$TIMEOUT"" -p ""$PROBES"" --duration $duration --export --outfile auto >> ""$logOut"" 2>&1"
 Task-Create -Name $MAIN_TASK -CmdLine $logInner -Schedule "MINUTE" -Mo "$stepMin"
 
