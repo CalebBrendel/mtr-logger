@@ -349,14 +349,67 @@ main(){
   try_setcap_cap_net_raw "$PYBIN" || echo "WARNING: ICMP may require sudo; you can use --proto tcp."
 
   echo "[8/12] Creating wrapper: $WRAPPER"
-  cat > "$WRAPPER" <<WRAP
+cat > "$WRAPPER" <<'WRAP'
 #!/usr/bin/env bash
 set -euo pipefail
-VENV="$VENV_DIR"
-source "\$VENV/bin/activate"
-exec "\$VENV/bin/python" -m mtrpy "\$@"
+
+VENV="/opt/mtr-logger/.venv"
+PREFIX="/opt/mtr-logger"
+WRAPPER="/usr/local/bin/mtr-logger"
+
+_uninstall() {
+  echo "This will uninstall mtr-logger from:"
+  echo "  PREFIX:  $PREFIX"
+  echo "  VENV:    $VENV"
+  echo "  WRAPPER: $WRAPPER"
+  echo
+  read -r -p "Proceed with uninstall? [y/N]: " CONFIRM
+  case "${CONFIRM,,}" in
+    y|yes) ;;
+    *) echo "Aborted."; exit 0 ;;
+  esac
+
+  echo "[1/6] Removing cron entries..."
+  TMP_OLD="$(mktemp)"; TMP_NEW="$(mktemp)"
+  if crontab -l > "$TMP_OLD" 2>/dev/null; then
+    grep -v -E 'mtr-logger\.lock|mtr-archive\.lock|mtrpy\.archiver|/usr/local/bin/mtr-logger|mtr-logger ' "$TMP_OLD" > "$TMP_NEW" || true
+    crontab "$TMP_NEW" || true
+  fi
+  rm -f "$TMP_OLD" "$TMP_NEW"
+
+  echo "[2/6] Dropping cap_net_raw (if set)..."
+  if command -v setcap >/dev/null 2>&1 && [[ -x "$VENV/bin/python" ]]; then
+    setcap -r "$VENV/bin/python" 2>/dev/null || true
+  fi
+
+  LOG_DIR="${HOME}/mtr/logs"
+  if [[ -d "$LOG_DIR" ]]; then
+    echo "[3/6] Logs detected at $LOG_DIR"
+    read -r -p "Delete logs as well? [y/N]: " DELLOGS
+    [[ "${DELLOGS,,}" =~ ^(y|yes)$ ]] && rm -rf "$LOG_DIR" && echo "    - Logs removed."
+  fi
+
+  echo "[4/6] Removing install dir: $PREFIX"
+  rm -rf "$PREFIX"
+
+  echo "[5/6] Removing wrapper: $WRAPPER"
+  rm -f "$WRAPPER"
+
+  echo "[6/6] Uninstall complete."
+}
+
+main() {
+  if [[ "${1:-}" == "uninstall" ]]; then
+    _uninstall
+    exit 0
+  fi
+  source "$VENV/bin/activate"
+  exec "$VENV/bin/python" -m mtrpy "$@"
+}
+main "$@"
 WRAP
-  chmod +x "$WRAPPER"
+
+chmod +x "$WRAPPER"
 
   echo "[9/12] Writing cron entries (root) ..."
   ASCII_FLAG=""; [[ "$ASCII" == "yes" ]] && ASCII_FLAG="--ascii"
