@@ -1,10 +1,10 @@
-<# windows-onefile-npcap.ps1 — One-command Windows installer for mtr-logger (with Npcap + Scapy traceroute)
-    - Python 3.13.3 (EXE first; no-visibility fallback to embeddable ZIP + pip bootstrap)
-    - Npcap silent install (WinPcap-compatible)
-    - venv + pip install -e .
-    - Scapy traceroute shim (icmp|tcp|udp), replaces previous tracert.exe wrapper
-    - Correct schtasks quoting via cmd.exe /d /c "<full command>"
-    - Optional inbound ICMP firewall rule
+<# windows-onefile-npcap-interactive.ps1 — One-command Windows installer for mtr-logger (Npcap interactive)
+    - Installs Python 3.13.3 (EXE; falls back to embeddable ZIP if needed)
+    - Installs Npcap **interactively** (no silent flag; OEM build is required for silent mode)
+    - Creates venv, installs your repo editable, installs scapy
+    - Scapy-based traceroute shim (icmp|tcp|udp) so Windows can do hop traces
+    - Scheduled Tasks with correct quoting
+    - Optional ICMP inbound firewall rule
     - PATH refresh for current session
 #>
 
@@ -24,17 +24,17 @@ $TIMEOUT_DEFAULT      = "0.3"
 $PROBES_DEFAULT       = "3"
 $ASCII_DEFAULT        = "yes"
 
-$LOGS_PER_HOUR_DEFAULT= 4          # must divide 60
+$LOGS_PER_HOUR_DEFAULT= 4
 $SAFETY_MARGIN_DEFAULT= 5
 $ARCHIVE_RETENTION_DEFAULT = 90
 
 # Python downloads
-$PY_VERSION = "3.13.3"
+$PY_VERSION  = "3.13.3"
 $PY_EXE_URL  = "https://www.python.org/ftp/python/$PY_VERSION/python-$PY_VERSION-amd64.exe"
 $PY_ZIP_URL  = "https://www.python.org/ftp/python/$PY_VERSION/python-$PY_VERSION-embed-amd64.zip"
 $GET_PIP_URL = "https://bootstrap.pypa.io/get-pip.py"
 
-# Npcap (adjust if you want to pin a different version)
+# Npcap (standard public build; will launch interactively)
 $NPCAP_URL = "https://nmap.org/npcap/dist/npcap-1.79.exe"
 
 # Derived (updated after prompts)
@@ -88,7 +88,7 @@ function Resolve-Python {
   }
   foreach ($c in @(
     "C:\Program Files\Python313\python.exe","C:\Program Files\Python312\python.exe","C:\Program Files\Python311\python.exe",
-    "$env:LOCALAPPDATA\Programs\Python\Python313\python.exe","$env:LOCALAPPDATA\Programs\Python\Python312\python.exe","$env:LOCALAPPROGRAMPATH\Python311\python.exe"
+    "$env:LOCALAPPDATA\Programs\Python\Python313\python.exe","$env:LOCALAPPDATA\Programs\Python\Python312\python.exe"
   )) { if (Test-Path $c) { return $c } }
   try { $pc=Get-Command python -ErrorAction Stop; if($pc.Source -and (Test-Path $pc.Source)){ return $pc.Source } } catch {}
   return $null
@@ -198,7 +198,7 @@ Write-Host @"
 |  Y Y  \  |  |  | \/ |  |_(  <_> ) /_/  > /_/  >  ___/|  | \/
 |__|_|  /__|  |__|    |____/\____/\___  /\___  / \___  >__|
       \/                         /_____//_____/      \/
-== mtr-logger bootstrap (Windows + Npcap) ==
+== mtr-logger bootstrap (Windows + Npcap interactive) ==
 "@
 
 # 1) Tools
@@ -225,15 +225,38 @@ if ($exeRes.Path) {
 }
 Check-PyVersion -PyExe $PYEXE | Out-Null
 
-# 3) Npcap
-Write-Host "[4/12] Installing Npcap (WinPcap-compatible)..."
-$tmpNpcap = Join-Path $env:TEMP ("npcap-"+[guid]::NewGuid().ToString()+".exe")
-Invoke-WebRequest -UseBasicParsing -Uri $NPCAP_URL -OutFile $tmpNpcap
-# /S silent, /winpcap_mode for WinPcap API, /admin_only=1 limits to Admins (safer)
-$npcArgs = "/S /winpcap_mode=yes /admin_only=yes"
-Start-Process -FilePath $tmpNpcap -ArgumentList $npcArgs -Wait
-try { Remove-Item $tmpNpcap -Force } catch {}
-Start-Sleep -Seconds 2
+# 3) Npcap (INTERACTIVE)
+Write-Host "[4/12] Installing Npcap (interactive — please click Install)…"
+# Skip if already installed
+$npcapInstalled = $false
+try {
+  $svc = Get-Service -Name "npcap" -ErrorAction SilentlyContinue
+  if ($svc) { $npcapInstalled = $true }
+} catch {}
+if (-not $npcapInstalled) {
+  $tmpNpcap = Join-Path $env:TEMP ("npcap-"+[guid]::NewGuid().ToString()+".exe")
+  Invoke-WebRequest -UseBasicParsing -Uri $NPCAP_URL -OutFile $tmpNpcap
+  Write-Host "    - Launching Npcap installer (no silent mode in free build). In the GUI:"
+  Write-Host "        ✔ Leave defaults, ensure 'Install Npcap in WinPcap API-compatible Mode' is checked."
+  Write-Host "        ✔ Click 'Install' and wait for completion."
+  $p = Start-Process -FilePath $tmpNpcap -PassThru
+  $p.WaitForExit()
+  try { Remove-Item $tmpNpcap -Force } catch {}
+  # Poll for install
+  Write-Host "    - Verifying Npcap install..."
+  for ($i=0; $i -lt 20; $i++) {
+    Start-Sleep -Seconds 1
+    try {
+      if (Get-Service -Name "npcap" -ErrorAction SilentlyContinue) { $npcapInstalled = $true; break }
+      if (Test-Path "HKLM:\SOFTWARE\Npcap") { $npcapInstalled = $true; break }
+    } catch {}
+  }
+}
+if (-not $npcapInstalled) {
+  Write-Host "WARNING: Npcap not detected. Hop-by-hop tracing may not work on Windows without it." -ForegroundColor Yellow
+} else {
+  Write-Host "    - Npcap detected."
+}
 
 # 4) Prompts
 Write-Host "[5/12] Prompting for settings..."
@@ -296,7 +319,7 @@ Write-Host "[7/12] Creating virtualenv + installing package..."
 $RUN_PY  = Join-Path $VENV_DIR "Scripts\python.exe"
 & $RUN_PY -m pip install -U pip wheel | Out-Null
 & $RUN_PY -m pip install -e $SRC_DIR | Out-Null
-# scapy for raw traceroute
+# scapy for raw traceroute (works with Npcap)
 & $RUN_PY -m pip install scapy | Out-Null
 
 # 6) Wrappers + uninstall
@@ -365,7 +388,6 @@ import os, sys, time, socket
 from scapy.all import IP, ICMP, UDP, TCP, sr1, conf
 
 def main(argv):
-    # Very small arg surface we need: -n (ignore), -m (maxhops), -w (timeout), --proto (custom)
     dest = None
     maxhops = 30
     timeout = 1.0
@@ -428,10 +450,9 @@ def main(argv):
             continue
 
         hop_ip = ans.src
-        # Destination reached?
         reached = (proto == "icmp" and ans.haslayer(ICMP) and ans.getlayer(ICMP).type==0) or \
                   (proto == "udp"  and ans.haslayer(ICMP) and ans.getlayer(ICMP).type==3) or \
-                  (proto == "tcp"  and ans.haslayer(TCP)  and ans.getlayer(TCP).flags & 0x12) # SYN-ACK
+                  (proto == "tcp"  and ans.haslayer(TCP)  and ans.getlayer(TCP).flags & 0x12)
         print(f"{ttl:2d}  {hop_ip}  {dt} ms")
         if reached:
             break
