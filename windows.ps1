@@ -1,7 +1,8 @@
-<#  setup_mtr-logger.ps1  — robust Windows bootstrap for mtr-logger
+<#  setup_mtr-logger.ps1  — robust Windows bootstrap for mtr-logger (PowerShell 5.1 compatible)
     - Run elevated (Run as administrator)
     - Ensures Python & Git (winget if available; Python has EXE fallback, Git has ZIP fallback)
     - Avoids MS Store "App execution alias" trap by resolving a real python.exe
+    - Creates venv, installs package (editable), wrapper, uninstall, and Scheduled Tasks
 #>
 
 $ErrorActionPreference = 'Stop'
@@ -26,13 +27,12 @@ $SAFETY_MARGIN_DEFAULT    = "5"
 $ARCHIVE_RETENTION_DEFAULT= "90"   # days
 
 # Derived (finalized after prompts)
-$SRC_DIR   = Join-Path $PREFIX_DEFAULT "src"
-$VENV_DIR  = Join-Path $PREFIX_DEFAULT ".venv"
-$BIN_DIR   = $WRAPPER_DIR_DEFAULT
-$WRAPPER_PS= Join-Path $BIN_DIR "mtr-logger.ps1"
-$WRAPPER_CMD=Join-Path $BIN_DIR "mtr-logger.cmd"
-$UNINSTALL_PS = Join-Path $BIN_DIR "uninstall.ps1"
-$LOG_DIR   = Join-Path $env:USERPROFILE "mtr\logs"
+$SRC_DIR_DEFAULT   = Join-Path $PREFIX_DEFAULT "src"
+$VENV_DIR_DEFAULT  = Join-Path $PREFIX_DEFAULT ".venv"
+$WRAPPER_PS_DEFAULT= Join-Path $WRAPPER_DIR_DEFAULT "mtr-logger.ps1"
+$WRAPPER_CMD_DEFAULT=Join-Path $WRAPPER_DIR_DEFAULT "mtr-logger.cmd"
+$UNINSTALL_PS_DEFAULT = Join-Path $WRAPPER_DIR_DEFAULT "uninstall.ps1"
+$LOG_DIR_DEFAULT   = Join-Path $env:USERPROFILE "mtr\logs"
 $MAIN_TASK = "mtr-logger\Log"
 $ARCH_TASK = "mtr-logger\Archive"
 
@@ -50,8 +50,9 @@ function Show-Logo {
 
 # ----------------- Helpers -----------------
 function Require-Admin {
-  if (-not ([Security.Principal.WindowsPrincipal] [Security.Principal.WindowsIdentity]::GetCurrent()
-    ).IsInRole([Security.Principal.WindowsBuiltInRole] "Administrator")) {
+  $id  = [Security.Principal.WindowsIdentity]::GetCurrent()
+  $pri = New-Object Security.Principal.WindowsPrincipal($id)
+  if (-not $pri.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
     Write-Host "Please run this script in an **elevated** PowerShell (Run as administrator)." -ForegroundColor Yellow
     exit 1
   }
@@ -61,12 +62,13 @@ function Read-Default([string]$Prompt, [string]$Default) {
   if ([string]::IsNullOrWhiteSpace($v)) { $Default } else { $v.Trim() }
 }
 function Read-YesNo([string]$Prompt, [string]$Default="Y") {
-  $opt = Read-Host "$Prompt [$Default]"; if ([string]::IsNullOrWhiteSpace($opt)) { $opt = $Default }
+  $opt = Read-Host "$Prompt [$Default]"
+  if ([string]::IsNullOrWhiteSpace($opt)) { $opt = $Default }
   switch ($opt.ToLower()) { 'y'{'Y'} 'yes'{'Y'} 'n'{'N'} 'no'{'N'} default{$Default.ToUpper()} }
 }
 function Ensure-Dir($p) { if (-not (Test-Path $p)) { New-Item -ItemType Directory -Path $p | Out-Null } }
 function Validate-FactorOf60([int]$n) { $n -in 1,2,3,4,5,6,10,12,15,20,30,60 }
-function Minute-Marks([int]$perHour) { $step=[int](60/$perHour); ((0..59|?{$_%$step-eq 0}) -join ",") }
+function Minute-Marks([int]$perHour) { $step=[int](60/$perHour); ((0..59 | Where-Object {$_%$step -eq 0}) -join ",") }
 function Refresh-ProcessPath {
   $env:Path = [Environment]::GetEnvironmentVariable('Path','Machine') + ';' +
               [Environment]::GetEnvironmentVariable('Path','User')
@@ -75,20 +77,22 @@ function Refresh-ProcessPath {
 # ----------------- Dependencies -----------------
 function Install-Python-Fallback {
   Write-Host " - Installing Python via official installer (silent)..." -ForegroundColor Yellow
-  $uri = "https://www.python.org/ftp/python/3.12.5/python-3.12.5-amd64.exe"  # stable direct link
+  $uri = "https://www.python.org/ftp/python/3.12.5/python-3.12.5-amd64.exe"
   $tmp = Join-Path $env:TEMP "python-installer.exe"
   Invoke-WebRequest -Uri $uri -OutFile $tmp
-  # Silent install for all users, add to PATH
   Start-Process $tmp -ArgumentList "/quiet InstallAllUsers=1 PrependPath=1 Include_test=0" -Wait
   Refresh-ProcessPath
 }
 function Ensure-Python {
-  # Prefer the 'py' launcher (bypasses MS Store alias), else python.exe
-  $py = Get-Command py -ErrorAction SilentlyContinue
-  $pyExe = Get-Command python -ErrorAction SilentlyContinue
-
-  if (-not $py -and -not $pyExe) {
-    if (Get-Command winget -ErrorAction SilentlyContinue) {
+  $pyOk = $false
+  try { if (Get-Command py -ErrorAction Stop) { $pyOk = $true } } catch {}
+  if (-not $pyOk) {
+    try { if (Get-Command python -ErrorAction Stop) { $pyOk = $true } } catch {}
+  }
+  if (-not $pyOk) {
+    $wingetOk = $false
+    try { if (Get-Command winget -ErrorAction Stop) { $wingetOk = $true } } catch {}
+    if ($wingetOk) {
       Write-Host " - Installing Python 3 via winget..."
       winget install -e --id Python.Python.3 --silent --accept-package-agreements --accept-source-agreements | Out-Null
       Refresh-ProcessPath
@@ -98,20 +102,27 @@ function Ensure-Python {
   }
 }
 function Resolve-PythonPath {
-  # Return a **real** python.exe path suitable for -m venv (not the MS Store alias)
-  $py = Get-Command py -ErrorAction SilentlyContinue
-  if ($py) {
-    # Get concrete interpreter path (first 3.x)
-    $list = (& py -0p) 2>$null
+  # Prefer py launcher list if available
+  try {
+    $py = Get-Command py -ErrorAction Stop
+    $list = & py -0p 2>$null
     if ($list) {
-      $first = ($list -split "`n" | Where-Object { $_ -match '\\python\.exe$' } | Select-Object -First 1).Trim()
-      if ($first -and (Test-Path $first)) { return $first }
+      foreach ($line in ($list -split "`n")) {
+        $exe = $line.Trim()
+        if ($exe -and (Test-Path $exe) -and ($exe -like "*\python.exe")) { return $exe }
+      }
     }
-    # Fallback to py -3
-    try { & py -3 -c "import sys;print(sys.executable)" | % { $_.Trim() } } catch {}
-  }
+    # Fallback: ask py -3 for actual path
+    try {
+      $p = & py -3 -c "import sys;print(sys.executable)" 2>$null
+      if ($p) { $p = $p.Trim(); if (Test-Path $p) { return $p } }
+    } catch {}
+  } catch {}
+  # Try common locations / path lookup
+  $exeFromPath = $null
+  try { $cmd = Get-Command python -ErrorAction Stop; $exeFromPath = $cmd.Source } catch {}
   $candidates = @(
-    (Get-Command python -ErrorAction SilentlyContinue)?.Source,
+    $exeFromPath,
     "C:\Python312\python.exe",
     "C:\Program Files\Python312\python.exe",
     "C:\Program Files\Python311\python.exe",
@@ -119,21 +130,19 @@ function Resolve-PythonPath {
     "$env:LOCALAPPDATA\Programs\Python\Python312\python.exe",
     "$env:LOCALAPPDATA\Programs\Python\Python311\python.exe",
     "$env:LOCALAPPDATA\Programs\Python\Python310\python.exe"
-  ) | Where-Object { $_ -and (Test-Path $_) }
-  if ($candidates.Count -gt 0) { return $candidates[0] }
+  )
+  foreach ($c in $candidates) { if ($c -and (Test-Path $c)) { return $c } }
   throw "Could not resolve a usable python.exe after installation."
 }
-
 function Ensure-Git {
-  $git = Get-Command git -ErrorAction SilentlyContinue
-  if ($git) { return $git.Source }
-
-  if (Get-Command winget -ErrorAction SilentlyContinue) {
+  try { $git = Get-Command git -ErrorAction Stop; return $git.Source } catch {}
+  $wingetOk = $false
+  try { if (Get-Command winget -ErrorAction Stop) { $wingetOk = $true } } catch {}
+  if ($wingetOk) {
     Write-Host " - Installing Git via winget..."
     winget install -e --id Git.Git --silent --accept-package-agreements --accept-source-agreements | Out-Null
     Refresh-ProcessPath
-    $git = Get-Command git -ErrorAction SilentlyContinue
-    if ($git) { return $git.Source }
+    try { $git = Get-Command git -ErrorAction Stop; return $git.Source } catch {}
   }
   Write-Host " - winget not available or Git still missing; will use ZIP fallback for repo cloning." -ForegroundColor Yellow
   return $null
@@ -184,8 +193,9 @@ Choose how to set timezone:
         $kw = Read-Default "Search keyword (e.g., Chicago or Central)" ""
         if ([string]::IsNullOrWhiteSpace($kw)) { Write-Host "    - Empty search."; continue }
         $all = List-TimeZones
-        $matches = $all | ? { $_ -match [Regex]::Escape($kw) }
-        if (-not $matches) { Write-Host "    - No matches."; continue }
+        $matches = @()
+        foreach ($z in $all) { if ($z -match [Regex]::Escape($kw)) { $matches += $z } }
+        if (-not $matches -or $matches.Count -eq 0) { Write-Host "    - No matches."; continue }
         $i=1; foreach ($z in $matches) { "{0,3}. {1}" -f $i,$z; $i++ }
         $pick = Read-Default "Pick number (or 0 to cancel)" "0"
         if ($pick -match '^\d+$') {
@@ -211,7 +221,7 @@ function ZipClone($RepoUrl, $Branch, $DestDir) {
   if (Test-Path $DestDir) { Remove-Item -Recurse -Force $DestDir }
   $tmpDir = Join-Path $env:TEMP ("mtr-src-" + [guid]::NewGuid().ToString())
   Expand-Archive -Path $tmpZip -DestinationPath $tmpDir -Force
-  $inner = Get-ChildItem -Path $tmpDir | ? { $_.PSIsContainer } | Select-Object -First 1
+  $inner = Get-ChildItem -Path $tmpDir | Where-Object { $_.PSIsContainer } | Select-Object -First 1
   if (-not $inner) { throw "Unexpected ZIP layout." }
   New-Item -ItemType Directory -Path $DestDir | Out-Null
   Copy-Item -Recurse -Force -Path (Join-Path $inner.FullName "*") -Destination $DestDir
@@ -357,7 +367,9 @@ Write-Host "[6/6] Uninstall complete."
 
 Write-Host "[8/10] Ensuring $BIN_DIR is on PATH..."
 $curPath = [Environment]::GetEnvironmentVariable("Path","Machine")
-if (-not ($curPath -split ';' | Where-Object { $_ -ieq $BIN_DIR })) {
+$onPath = $false
+foreach ($seg in ($curPath -split ';')) { if ($seg -ieq $BIN_DIR) { $onPath = $true; break } }
+if (-not $onPath) {
   [Environment]::SetEnvironmentVariable("Path", ($curPath.TrimEnd(';') + ";" + $BIN_DIR), "Machine")
   Write-Host "    - Added to system PATH. Open a new terminal to pick it up." -ForegroundColor Yellow
 }
