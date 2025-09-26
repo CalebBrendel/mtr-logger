@@ -1,10 +1,11 @@
-<#  windows-onefile.ps1 — One-command Windows installer for mtr-logger (PowerShell 5.1+)
-    v7.2:
-      - schtasks /TR token passed as ONE quoted string via cmd.exe /d /c
-      - Python traceroute shim (parses tracert → prints traceroute-like lines)
-      - Force asyncio.WindowsSelectorEventLoopPolicy via .pth (silences “Event loop is closed” on Windows)
-      - EXE-first Python install; embeddable ZIP fallback with pip bootstrap
-      - PATH refresh for current session; immediate mtr-logger availability
+<# windows-onefile-npcap.ps1 — One-command Windows installer for mtr-logger (with Npcap + Scapy traceroute)
+    - Python 3.13.3 (EXE first; no-visibility fallback to embeddable ZIP + pip bootstrap)
+    - Npcap silent install (WinPcap-compatible)
+    - venv + pip install -e .
+    - Scapy traceroute shim (icmp|tcp|udp), replaces previous tracert.exe wrapper
+    - Correct schtasks quoting via cmd.exe /d /c "<full command>"
+    - Optional inbound ICMP firewall rule
+    - PATH refresh for current session
 #>
 
 $ErrorActionPreference = 'Stop'
@@ -32,6 +33,9 @@ $PY_VERSION = "3.13.3"
 $PY_EXE_URL  = "https://www.python.org/ftp/python/$PY_VERSION/python-$PY_VERSION-amd64.exe"
 $PY_ZIP_URL  = "https://www.python.org/ftp/python/$PY_VERSION/python-$PY_VERSION-embed-amd64.zip"
 $GET_PIP_URL = "https://bootstrap.pypa.io/get-pip.py"
+
+# Npcap (adjust if you want to pin a different version)
+$NPCAP_URL = "https://nmap.org/npcap/dist/npcap-1.79.exe"
 
 # Derived (updated after prompts)
 $SRC_DIR   = Join-Path $PREFIX_DEFAULT "src"
@@ -61,10 +65,10 @@ function Minute-Marks([int]$perHour) { $step=[int](60/$perHour); ($((0..59 | Whe
 function Refresh-Path {
   $machine = [Environment]::GetEnvironmentVariable('Path','Machine')
   $user    = [Environment]::GetEnvironmentVariable('Path','User')
-  if ($machine -and $user)      { $env:Path = ($machine.TrimEnd(';') + ';' + $user) }
-  elseif ($machine)             { $env:Path = $machine }
-  elseif ($user)                { $env:Path = $user }
-  else                          { $env:Path = "" }
+  if     ($machine -and $user) { $env:Path = ($machine.TrimEnd(';') + ';' + $user) }
+  elseif ($machine)            { $env:Path = $machine }
+  elseif ($user)               { $env:Path = $user }
+  else                         { $env:Path = "" }
 }
 function Remove-StorePythonStubs {
   $wa = Join-Path $env:LOCALAPPDATA "Microsoft\WindowsApps"
@@ -72,55 +76,20 @@ function Remove-StorePythonStubs {
     $p = Join-Path $wa $s; if (Test-Path $p) { try { Remove-Item -Force $p } catch {} }
   }
 }
-
-# --- Python resolvers ---
-function Resolve-Python-FromRegistry {
-  $roots = @(
-    "HKLM:\SOFTWARE\Python\PythonCore",
-    "HKLM:\SOFTWARE\WOW6432Node\Python\PythonCore",
-    "HKCU:\SOFTWARE\Python\PythonCore"
-  )
-  $cands = @()
-  foreach($root in $roots){
-    try {
-      if(Test-Path $root){
-        Get-ChildItem $root -ErrorAction Stop | ForEach-Object {
-          $ip = Join-Path $_.PSPath "InstallPath"
-          if(Test-Path $ip){
-            $path = (Get-ItemProperty -Path $ip -Name "(default)" -ErrorAction SilentlyContinue)."(default)"
-            if($path){
-              $exe = Join-Path $path "python.exe"
-              if(Test-Path $exe){ $cands += $exe }
-            }
-          }
-        }
-      }
-    } catch {}
-  }
-  $cands | Sort-Object -Descending -Unique | Select-Object -First 1
-}
 function Resolve-Python {
-  try {
-    Get-Command py -ErrorAction Stop | Out-Null
-    $p = & py -3 -c "import sys,os;print(sys.executable if os.path.exists(sys.executable) else '')" 2>$null
-    if ($p) { $p=$p.Trim(); if (Test-Path $p) { return $p } }
-  } catch {}
-  $reg = Resolve-Python-FromRegistry
-  if($reg){ return $reg }
-  $cands=@(
-    "C:\Program Files\Python313\python.exe","C:\Program Files\Python312\python.exe","C:\Program Files\Python311\python.exe","C:\Program Files\Python310\python.exe",
-    "C:\Python313\python.exe","C:\Python312\python.exe","C:\Python311\python.exe","C:\Python310\python.exe",
-    "$env:LOCALAPPDATA\Programs\Python\Python313\python.exe","$env:LOCALAPPDATA\Programs\Python\Python312\python.exe","$env:LOCALAPPDATA\Programs\Python\Python311\python.exe","$env:LOCALAPPDATA\Programs\Python\Python310\python.exe"
-  )
-  foreach ($c in $cands) { if (Test-Path $c) { return $c } }
-  foreach($root in @("C:\Program Files","C:\Program Files (x86)")){
-    try {
-      if(Test-Path $root){
-        $hit = Get-ChildItem -Path $root -Recurse -ErrorAction SilentlyContinue -Filter python.exe -File | Select-Object -First 1
-        if($hit){ return $hit.FullName }
-      }
-    } catch {}
+  try { Get-Command py -ErrorAction Stop | Out-Null; $p = & py -3 -c "import sys,os;print(sys.executable if os.path.exists(sys.executable) else '')" 2>$null; if ($p -and (Test-Path $p.Trim())) { return $p.Trim() } } catch {}
+  foreach($root in @("HKLM:\SOFTWARE\Python\PythonCore","HKLM:\SOFTWARE\WOW6432Node\Python\PythonCore","HKCU:\SOFTWARE\Python\PythonCore")){
+    try { if(Test-Path $root){ Get-ChildItem $root -ErrorAction Stop | ForEach-Object {
+      $ip = Join-Path $_.PSPath "InstallPath"
+      if(Test-Path $ip){
+        $path = (Get-ItemProperty -Path $ip -Name "(default)" -ErrorAction SilentlyContinue)."(default)"
+        if($path){ $exe = Join-Path $path "python.exe"; if(Test-Path $exe){ return $exe } }
+      } } } } catch {}
   }
+  foreach ($c in @(
+    "C:\Program Files\Python313\python.exe","C:\Program Files\Python312\python.exe","C:\Program Files\Python311\python.exe",
+    "$env:LOCALAPPDATA\Programs\Python\Python313\python.exe","$env:LOCALAPPDATA\Programs\Python\Python312\python.exe","$env:LOCALAPPROGRAMPATH\Python311\python.exe"
+  )) { if (Test-Path $c) { return $c } }
   try { $pc=Get-Command python -ErrorAction Stop; if($pc.Source -and (Test-Path $pc.Source)){ return $pc.Source } } catch {}
   return $null
 }
@@ -171,16 +140,9 @@ function Install-Python-EXE {
   try { Remove-Item $tmp -Force } catch {}
   return @{ Path=$py; Log=$log }
 }
-
 function Install-Python-Embeddable {
-  $existing = Join-Path $EMB_DIR "python.exe"
-  if (Test-Path $existing) {
-    Write-Host "Embeddable Python already present at $existing — reusing."
-    return $existing
-  }
   if (Test-Path $EMB_DIR) { try { Remove-Item -Recurse -Force $EMB_DIR } catch {} }
   Ensure-Dir $EMB_DIR
-
   $zip   = Join-Path $env:TEMP ("python-embed-"+$PY_VERSION+"-"+[guid]::NewGuid().ToString()+".zip")
   Write-Host "Downloading Python $PY_VERSION (embeddable ZIP)..."
   Invoke-WebRequest -UseBasicParsing -Uri $PY_ZIP_URL -OutFile $zip
@@ -188,30 +150,16 @@ function Install-Python-Embeddable {
   Add-Type -AssemblyName System.IO.Compression.FileSystem
   [System.IO.Compression.ZipFile]::ExtractToDirectory($zip, $EMB_DIR)
   try { Remove-Item $zip -Force } catch {}
-
-  # Enable site
   $pth = Get-ChildItem -Path $EMB_DIR -Filter "python*.pth" -File | Select-Object -First 1
-  if ($pth) {
-    $content = Get-Content $pth
-    $content = $content -replace '^\s*#\s*import site\s*$', 'import site'
-    Set-Content -Path $pth -Value $content -Encoding ASCII
-  }
-
-  # Bootstrap pip
-  Write-Host "Bootstrapping pip inside embeddable..."
+  if ($pth) { (Get-Content $pth) -replace '^\s*#\s*import site\s*$', 'import site' | Set-Content -Encoding ASCII $pth }
   $getpip = Join-Path $env:TEMP ("get-pip-"+[guid]::NewGuid().ToString()+".py")
   Invoke-WebRequest -UseBasicParsing -Uri $GET_PIP_URL -OutFile $getpip
   $pyexe = Join-Path $EMB_DIR "python.exe"
   & $pyexe $getpip --no-warn-script-location
   try { Remove-Item $getpip -Force } catch {}
-
-  & $pyexe -m pip --version
-  if ($LASTEXITCODE -ne 0) { throw "pip did not install correctly in embeddable runtime." }
-
   & $pyexe -m pip install -U pip wheel --no-warn-script-location | Out-Null
   return $pyexe
 }
-
 function Ensure-Embeddable-Pip([string]$PyExe) {
   $root = Split-Path -Parent $PyExe
   $pth = Get-ChildItem -Path $root -Filter "python*.pth" -File | Select-Object -First 1
@@ -220,36 +168,17 @@ function Ensure-Embeddable-Pip([string]$PyExe) {
     $new = $content -replace '^\s*#\s*import site\s*$', 'import site'
     if ($new -ne $content) { Set-Content -Path $pth -Value $new -Encoding ASCII }
   }
-  try {
-    & $PyExe -m pip --version 2>$null | Out-Null
-    if ($LASTEXITCODE -eq 0) { return }
-  } catch {}
-  Write-Host "pip not found in embeddable — installing now..."
+  try { & $PyExe -m pip --version 2>$null | Out-Null; if ($LASTEXITCODE -eq 0) { return } } catch {}
   $getpip = Join-Path $env:TEMP ("get-pip-"+[guid]::NewGuid().ToString()+".py")
-  $pipLog = Join-Path $env:TEMP ("getpip-repair-"+(Get-Date -Format "yyyyMMdd-HHmmss")+".log")
   Invoke-WebRequest -UseBasicParsing -Uri $GET_PIP_URL -OutFile $getpip
-  & $PyExe $getpip --no-warn-script-location *> $pipLog
+  & $PyExe $getpip --no-warn-script-location
   try { Remove-Item $getpip -Force } catch {}
-  & $PyExe -m pip --version 2>$null | Out-Null
-  if ($LASTEXITCODE -ne 0) {
-    Write-Host "get-pip repair log (tail):" -ForegroundColor Yellow
-    try { Get-Content -Path $pipLog -Tail 80 | ForEach-Object { Write-Host "  $_" } } catch {}
-    throw "pip still missing in embeddable runtime."
-  }
 }
 
-# --------- Scheduled Task helpers (safe/quiet) ---------
-function Task-Exists([string]$Name) {
-  cmd /c "schtasks /Query /TN `"$Name`" >NUL 2>&1"
-  return ($LASTEXITCODE -eq 0)
-}
-function Task-Delete-IfExists([string]$Name) {
-  if (Task-Exists $Name) {
-    cmd /c "schtasks /Delete /TN `"$Name`" /F >NUL 2>&1"
-  }
-}
+# --------- Scheduled Task helpers ---------
+function Task-Exists([string]$Name) { cmd /c "schtasks /Query /TN `"$Name`" >NUL 2>&1"; return ($LASTEXITCODE -eq 0) }
+function Task-Delete-IfExists([string]$Name) { if (Task-Exists $Name) { cmd /c "schtasks /Delete /TN `"$Name`" /F >NUL 2>&1" } }
 function Task-Create([string]$Name, [string]$CmdLine, [string]$Schedule, [string]$Mo = "", [string]$StartTime = "") {
-  # Wrap with cmd.exe and pass ENTIRE /TR as a single quoted token
   $Wrapped = "cmd.exe /d /c " + $CmdLine
   $WrappedQuoted = '"' + $Wrapped + '"'
   $args = @("/Create","/TN",$Name,"/TR",$WrappedQuoted,"/RU","SYSTEM","/RL","HIGHEST","/F","/SC",$Schedule)
@@ -258,7 +187,7 @@ function Task-Create([string]$Name, [string]$CmdLine, [string]$Schedule, [string
   Start-Process -FilePath schtasks.exe -ArgumentList $args -NoNewWindow -Wait
 }
 
-# ----------------- Main flow -----------------
+# ----------------- Main -----------------
 Require-Admin
 Ensure-TLS12
 
@@ -269,21 +198,16 @@ Write-Host @"
 |  Y Y  \  |  |  | \/ |  |_(  <_> ) /_/  > /_/  >  ___/|  | \/
 |__|_|  /__|  |__|    |____/\____/\___  /\___  / \___  >__|
       \/                         /_____//_____/      \/
-== mtr-logger bootstrap (Windows, one-file) ==
+== mtr-logger bootstrap (Windows + Npcap) ==
 "@
 
-Write-Host "[1/12] Ensuring Chocolatey..."; if (-not (Get-Command choco.exe -ErrorAction SilentlyContinue)) {
-  Set-ExecutionPolicy Bypass -Scope Process -Force
-  [System.Net.ServicePointManager]::SecurityProtocol = [System.Net.SecurityProtocolType]::Tls12
-  Invoke-Expression ((New-Object System.Net.WebClient).DownloadString('https://community.chocolatey.org/install.ps1'))
-  $env:Path += ";$env:ALLUSERSPROFILE\chocolatey\bin"
-}
-
+# 1) Tools
+Write-Host "[1/12] Ensuring Chocolatey..."
+Ensure-Choco
 Write-Host "[2/12] Installing Git + curl (Chocolatey)..."
-choco install -y --no-progress git | Out-Null
-choco install -y --no-progress curl | Out-Null
-Refresh-Path
+Ensure-GitCurl
 
+# 2) Python
 Write-Host "[3/12] Installing Python..."
 $exeRes = Install-Python-EXE
 $PYEXE = $null
@@ -291,9 +215,9 @@ if ($exeRes.Path) {
   $PYEXE = $exeRes.Path
   Write-Host ("    - Python (EXE): {0}" -f $PYEXE)
 } else {
-  Write-Host "    - EXE install not available (policy or visibility). Falling back to embeddable ZIP…"
+  Write-Host "    - EXE install not visible; falling back to embeddable ZIP…"
   if ($exeRes.Log -and (Test-Path $exeRes.Log)) {
-    Write-Host "    (Installer log tail for reference):"
+    Write-Host "    (Installer log tail):"
     try { Get-Content -Path $exeRes.Log -Tail 40 | ForEach-Object { Write-Host "      $_" } } catch {}
   }
   $PYEXE = Install-Python-Embeddable
@@ -301,7 +225,18 @@ if ($exeRes.Path) {
 }
 Check-PyVersion -PyExe $PYEXE | Out-Null
 
-Write-Host "[4/12] Prompting for settings..."
+# 3) Npcap
+Write-Host "[4/12] Installing Npcap (WinPcap-compatible)..."
+$tmpNpcap = Join-Path $env:TEMP ("npcap-"+[guid]::NewGuid().ToString()+".exe")
+Invoke-WebRequest -UseBasicParsing -Uri $NPCAP_URL -OutFile $tmpNpcap
+# /S silent, /winpcap_mode for WinPcap API, /admin_only=1 limits to Admins (safer)
+$npcArgs = "/S /winpcap_mode=yes /admin_only=yes"
+Start-Process -FilePath $tmpNpcap -ArgumentList $npcArgs -Wait
+try { Remove-Item $tmpNpcap -Force } catch {}
+Start-Sleep -Seconds 2
+
+# 4) Prompts
+Write-Host "[5/12] Prompting for settings..."
 $GIT_URL  = Read-Default "Git URL"              $GIT_URL_DEFAULT
 if ($GIT_URL -notmatch '^https://|^git@') { Write-Host "WARNING: invalid URL; using default."; $GIT_URL = $GIT_URL_DEFAULT }
 $BRANCH   = Read-Default "Branch"               $BRANCH_DEFAULT
@@ -340,10 +275,9 @@ Write-Host ("  Window seconds: {0}" -f $windowSec)
 Write-Host ("  Duration seconds: {0}" -f $duration)
 Write-Host ""
 
-Write-Host "[5/12] Preparing install root: $PREFIX"
+# 5) Repo + venv
+Write-Host "[6/12] Preparing install root + cloning repo..."
 Ensure-Dir $PREFIX
-
-Write-Host "[6/12] Cloning/updating repo..."
 if (Test-Path (Join-Path $SRC_DIR ".git")) {
   git -C $SRC_DIR remote set-url origin $GIT_URL | Out-Null
   git -C $SRC_DIR fetch origin --depth=1 | Out-Null
@@ -357,26 +291,16 @@ if (-not (Test-Path (Join-Path $SRC_DIR "pyproject.toml"))) {
   Write-Host "pyproject.toml not found in $SRC_DIR" -ForegroundColor Red; exit 1
 }
 
-# Interpreter selection
-$UsingEmbeddable = ($PYEXE -like "*\pyembed\*")
-if ($UsingEmbeddable) {
-  Write-Host "[7/12] Using embeddable Python at $PYEXE (no venv)"
-  Ensure-Embeddable-Pip -PyExe $PYEXE
-  $RUN_PY = $PYEXE
-  Write-Host "[8/12] Installing package (editable) into embeddable runtime..."
-  & $RUN_PY -m pip install -U pip wheel | Out-Null
-  & $RUN_PY -m pip install -e $SRC_DIR | Out-Null
-} else {
-  Write-Host "[7/12] Creating virtualenv: $VENV_DIR"
-  Ensure-Dir $VENV_DIR
-  & $PYEXE -m venv $VENV_DIR
-  $RUN_PY  = Join-Path $VENV_DIR "Scripts\python.exe"
-  Write-Host "[8/12] Installing package (editable) into venv..."
-  & $RUN_PY -m pip install -U pip wheel | Out-Null
-  & $RUN_PY -m pip install -e $SRC_DIR | Out-Null
-}
+Write-Host "[7/12] Creating virtualenv + installing package..."
+& $PYEXE -m venv $VENV_DIR
+$RUN_PY  = Join-Path $VENV_DIR "Scripts\python.exe"
+& $RUN_PY -m pip install -U pip wheel | Out-Null
+& $RUN_PY -m pip install -e $SRC_DIR | Out-Null
+# scapy for raw traceroute
+& $RUN_PY -m pip install scapy | Out-Null
 
-Write-Host "[9/12] Creating wrapper, traceroute shim, and uninstall in $BIN_DIR"
+# 6) Wrappers + uninstall
+Write-Host "[8/12] Creating wrapper, traceroute shim, and uninstall in $BIN_DIR"
 Ensure-Dir $BIN_DIR
 
 # Uninstall
@@ -389,28 +313,29 @@ Write-Host "  WRAPPER: $WRAPPER_CMD / $WRAPPER_PS"
 `$ans = Read-Host "Proceed with uninstall? [y/N]"
 if (!(`$ans) -or `$ans.ToLower() -notin @('y','yes')) { Write-Host "Aborted."; exit 0 }
 
-Write-Host "[1/5] Removing Scheduled Tasks..."
+Write-Host "[1/6] Removing Scheduled Tasks..."
 cmd /c "schtasks /Delete /TN `"$MAIN_TASK`" /F >NUL 2>&1"
 cmd /c "schtasks /Delete /TN `"$ARCH_TASK`" /F >NUL 2>&1"
 
-Write-Host "[2/5] Removing install dir..."
+Write-Host "[2/6] Removing install dir..."
 if (Test-Path "$PREFIX") { Remove-Item -Recurse -Force "$PREFIX" }
 
-Write-Host "[3/5] Removing wrappers..."
+Write-Host "[3/6] Removing wrappers..."
 if (Test-Path "$WRAPPER_CMD") { Remove-Item -Force "$WRAPPER_CMD" }
 if (Test-Path "$WRAPPER_PS")  { Remove-Item -Force "$WRAPPER_PS" }
-if (Test-Path (Join-Path "$BIN_DIR" "traceroute.cmd")) { Remove-Item -Force (Join-Path "$BIN_DIR" "traceroute.cmd") }
-if (Test-Path (Join-Path "$BIN_DIR" "traceroute.ps1")) { Remove-Item -Force (Join-Path "$BIN_DIR" "traceroute.ps1") }
 if (Test-Path (Join-Path "$BIN_DIR" "traceroute.py"))  { Remove-Item -Force (Join-Path "$BIN_DIR" "traceroute.py") }
 
-Write-Host "[4/5] (Optional) Remove logs at `$env:USERPROFILE\mtr\logs"
+Write-Host "[4/6] (Optional) Remove logs at `$env:USERPROFILE\mtr\logs"
 `$del = Read-Host "Delete logs as well? [y/N]"
 if (`$del -and `$del.ToLower() -in @('y','yes')) {
   `$logdir = Join-Path `$env:USERPROFILE 'mtr\logs'
   if (Test-Path `$logdir) { Remove-Item -Recurse -Force `$logdir }
 }
 
-Write-Host "[5/5] Uninstall complete."
+Write-Host "[5/6] Removing ICMP firewall rule (if present)..."
+Get-NetFirewallRule -DisplayName "Allow ICMPv4 for traceroute" -ErrorAction SilentlyContinue | Remove-NetFirewallRule
+
+Write-Host "[6/6] Uninstall complete."
 "@ | Set-Content -Encoding UTF8 $UNINSTALL_PS
 
 # Wrapper (PS)
@@ -420,10 +345,6 @@ if (`$Args.Count -gt 0 -and `$Args[0].ToString().ToLower() -eq 'uninstall') {
   & "$UNINSTALL_PS"
   exit `$LASTEXITCODE
 }
-# Force Selector loop on Windows in case mtrpy does not import site fast enough
-try {
-  import-module -Name Microsoft.PowerShell.Management -ErrorAction SilentlyContinue | Out-Null
-} catch {}
 & "$RUN_PY" -m mtrpy @Args
 "@ | Set-Content -Encoding UTF8 $WRAPPER_PS
 
@@ -438,25 +359,38 @@ powershell -NoProfile -ExecutionPolicy Bypass -Command ^
   "& `"$WRAPPER_PS`" %*"
 "@ | Set-Content -Encoding OEM $WRAPPER_CMD
 
-# --- traceroute shim (Python → tracert.exe → linux-like output) ---
+# --- Scapy-based traceroute shim (supports icmp|tcp|udp) ---
 $trPy = @'
-import re, subprocess, sys, os
+import os, sys, time, socket
+from scapy.all import IP, ICMP, UDP, TCP, sr1, conf
 
 def main(argv):
+    # Very small arg surface we need: -n (ignore), -m (maxhops), -w (timeout), --proto (custom)
     dest = None
-    numeric = False
-    maxhops = None
-    timeout_s = None
+    maxhops = 30
+    timeout = 1.0
+    proto = "icmp"
+    dport = 33434  # UDP default
+    tport = 80     # TCP default
 
     it = iter(argv)
     for a in it:
         if a == "-n":
-            numeric = True
+            pass
         elif a == "-m":
             try: maxhops = int(next(it))
             except StopIteration: pass
         elif a == "-w":
-            try: timeout_s = float(next(it))
+            try: timeout = float(next(it))
+            except StopIteration: pass
+        elif a == "--proto":
+            try: proto = next(it)
+            except StopIteration: pass
+        elif a == "--dport":
+            try: dport = int(next(it))
+            except StopIteration: pass
+        elif a == "--tport":
+            try: tport = int(next(it))
             except StopIteration: pass
         elif a.startswith("-"):
             continue
@@ -464,95 +398,70 @@ def main(argv):
             dest = a
 
     if not dest:
-        print("Usage: traceroute <host>", file=sys.stderr)
+        print("Usage: traceroute <host> [--proto icmp|udp|tcp]", file=sys.stderr)
+        return 2
+
+    try:
+        dst_ip = socket.gethostbyname(dest)
+    except socket.gaierror:
+        print(f"Cannot resolve {dest}", file=sys.stderr)
         return 1
 
-    tr = os.path.join(os.environ.get("SystemRoot", r"C:\Windows"), "System32", "tracert.exe")
-    if not os.path.exists(tr):
-        print("tracert.exe not found", file=sys.stderr)
-        return 1
+    conf.verb = 0
+    print(f"traceroute to {dest} ({dst_ip}), proto={proto}")
 
-    args = [tr]
-    if numeric: args.append("-d")
-    if maxhops: args += ["-h", str(int(maxhops))]
-    if timeout_s: args += ["-w", str(int(round(timeout_s*1000)))]
-    args.append(dest)
-
-    cp = subprocess.run(args, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, encoding="utf-8", errors="replace")
-
-    print(f"traceroute to {dest}, using Windows tracert")
-    hop_re = re.compile(r"^\s*(\d+)\s+(.+)$")
-    for line in cp.stdout.splitlines():
-        m = hop_re.match(line)
-        if not m:
-            continue
-        hop = int(m.group(1))
-        rest = m.group(2).replace("< 1 ms", "1 ms").replace("<1 ms","1 ms")
-        if "Request timed out" in rest:
-            print(f"{hop:2d}  *  *  *")
-            continue
-        rtts = [int(x) for x in re.findall(r"(\\d+)\\s*ms", rest)]
-        ips  = re.findall(r"(\\d{1,3}(?:\\.\\d{1,3}){3})", rest)
-        ip = ips[-1] if ips else "???"
-        if not rtts:
-            print(f"{hop:2d}  {ip}  *  *  *")
+    for ttl in range(1, maxhops+1):
+        pkt = IP(dst=dst_ip, ttl=ttl)
+        if proto == "udp":
+            layer = UDP(dport=dport)
+        elif proto == "tcp":
+            layer = TCP(dport=tport, flags="S")
         else:
-            print(f"{hop:2d}  {ip}  " + "  ".join(f"{v} ms" for v in rtts[:3]))
-    return cp.returncode
+            layer = ICMP()
+
+        t0 = time.time()
+        ans = sr1(pkt/layer, timeout=timeout)
+        dt = int((time.time()-t0)*1000)
+
+        if ans is None:
+            print(f"{ttl:2d}  *  *  *")
+            continue
+
+        hop_ip = ans.src
+        # Destination reached?
+        reached = (proto == "icmp" and ans.haslayer(ICMP) and ans.getlayer(ICMP).type==0) or \
+                  (proto == "udp"  and ans.haslayer(ICMP) and ans.getlayer(ICMP).type==3) or \
+                  (proto == "tcp"  and ans.haslayer(TCP)  and ans.getlayer(TCP).flags & 0x12) # SYN-ACK
+        print(f"{ttl:2d}  {hop_ip}  {dt} ms")
+        if reached:
+            break
+
+    return 0
 
 if __name__ == "__main__":
     sys.exit(main(sys.argv[1:]))
 '@
 Set-Content -Encoding UTF8 (Join-Path $BIN_DIR "traceroute.py") $trPy
 
-# traceroute.cmd chooses venv python first, then embeddable
-$trCmd = @'
-@echo off
-setlocal
-set VENV_PY=%~dp0..\ .venv\Scripts\python.exe
-set VENV_PY=%VENV_PY:..\ .venv=..\ .venv%
-set VENV_PY=%VENV_PY: =%
-if exist "%VENV_PY%" (
-  "%VENV_PY%" "%~dp0traceroute.py" %* 2>&1
-  exit /b %ERRORLEVEL%
-)
-if exist "%~dp0..\pyembed\python.exe" (
-  "%~dp0..\pyembed\python.exe" "%~dp0traceroute.py" %* 2>&1
-  exit /b %ERRORLEVEL%
-)
-echo Python not found for traceroute shim 1>&2
-exit /b 1
-'@
-Set-Content -Encoding ASCII (Join-Path $BIN_DIR "traceroute.cmd") $trCmd
-
-# --- Force Selector event loop via .pth ---
-# install to venv site-packages, or embeddable Lib\site-packages
-$site = $null
-try { $site = & $RUN_PY -c "import site,sys;print((site.getsitepackages() or [sys.prefix])[0])" } catch {}
-if (-not $site -or -not (Test-Path $site)) {
-  $site = Join-Path (Split-Path $RUN_PY -Parent) "Lib\site-packages"
-  Ensure-Dir $site
-}
-$mod = @'
-import sys
-if sys.platform.startswith("win"):
-    try:
-        import asyncio
-        asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
-    except Exception:
-        pass
-'@
-Set-Content -Encoding UTF8 (Join-Path $site "win_asyncio_policy.py") $mod
-Set-Content -Encoding ASCII (Join-Path $site "zzz_win_asyncio_policy.pth") "import win_asyncio_policy"
-
-Write-Host "[10/12] Ensuring $BIN_DIR on system PATH..."
+# 7) PATH + optional firewall
+Write-Host "[9/12] Ensuring $BIN_DIR on system PATH..."
 $curPath = [Environment]::GetEnvironmentVariable("Path","Machine")
 if (-not ($curPath -split ';' | Where-Object { $_ -ieq $BIN_DIR })) {
   [Environment]::SetEnvironmentVariable("Path", ($curPath.TrimEnd(';') + ";" + $BIN_DIR), "Machine")
   Write-Host "    - Added to system PATH (Machine)."
 }
 
-# ----------------- Scheduled Tasks -----------------
+Write-Host "[10/12] Optional: allow ICMPv4 inbound for traceroute hops"
+$addICMP = Read-Default "Add firewall rule for ICMPv4 types 0,3,11? (y/N)" "N"
+if ($addICMP.ToUpper() -eq "Y") {
+  try {
+    New-NetFirewallRule -DisplayName "Allow ICMPv4 for traceroute" `
+      -Direction Inbound -Protocol ICMPv4 -IcmpType 0,3,11 -Action Allow -Profile Any | Out-Null
+    Write-Host "    - Rule added."
+  } catch { Write-Host "    - Could not add firewall rule (continuing)." -ForegroundColor Yellow }
+}
+
+# 8) Scheduled Tasks
 Write-Host "[11/12] Creating Scheduled Tasks..."
 Ensure-Dir $LOG_DIR
 $logOut = Join-Path $env:USERPROFILE "mtr-logger.log"
@@ -561,24 +470,19 @@ $archOut= Join-Path $env:USERPROFILE "mtr-logger-archive.log"
 Task-Delete-IfExists $MAIN_TASK
 Task-Delete-IfExists $ARCH_TASK
 
-$stepMin = [int](60 / $LPH)
-$windowSec = $stepMin * 60
-$duration = $windowSec - $SAFETY
-
-# Build /TR inner command; Task-Create wraps with cmd.exe /d /c and quotes once
 $logInner = """$WRAPPER_CMD"" ""$TARGET"" --proto ""$PROTO"" --dns ""$DNS_MODE"" -i ""$INTERVAL"" --timeout ""$TIMEOUT"" -p ""$PROBES"" --duration $duration --export --outfile auto >> ""$logOut"" 2>&1"
 Task-Create -Name $MAIN_TASK -CmdLine $logInner -Schedule "MINUTE" -Mo "$stepMin"
 
 $archInner = """$RUN_PY"" -m mtrpy.archiver --retention $ARCHIVE_RETENTION_DEFAULT >> ""$archOut"" 2>&1"
 Task-Create -Name $ARCH_TASK -CmdLine $archInner -Schedule "DAILY" -StartTime "00:00"
 
-# ----------------- Self-test + PATH refresh (CURRENT SESSION) -----------------
+# 9) PATH refresh + Self-test
 Write-Host "[12/12] PATH refresh and self-test..."
 Refresh-Path
 if (($env:Path -split ';') -notcontains $BIN_DIR) { $env:Path = "$BIN_DIR;$env:Path" }
 
 try {
-  & "$WRAPPER_PS" $TARGET --proto $PROTO --dns $DNS_MODE -i $INTERVAL --timeout $TIMEOUT -p $PROBES --duration 5 --export --outfile auto | Out-Null
+  & "$WRAPPER_PS" $TARGET --proto $PROTO --dns $DNS_MODE -i $INTERVAL --timeout $TIMEOUT -p $PROBES --duration 3 --export --outfile auto | Out-Null
   Write-Host "    - Self-test invoked."
 } catch {
   Write-Host "    - Self-test not conclusive (ok to ignore)."
@@ -587,21 +491,8 @@ try {
 Write-Host ""
 Write-Host "✅ Install complete."
 Write-Host "Try interactive NOW (no new terminal needed):"
+Write-Host "  mtr-logger $TARGET --proto $PROTO"
+Write-Host "Or try TCP if ICMP seems filtered:"
 Write-Host "  mtr-logger $TARGET --proto tcp"
 Write-Host "Uninstall anytime:  mtr-logger uninstall"
 Write-Host "Logs: $LOG_DIR"
-
-# --------------------------------------------------------------------
-$py = "C:\mtr-logger\.venv\Scripts\python.exe"
-if (!(Test-Path $py)) { $py = "C:\mtr-logger\pyembed\python.exe" }
-if (Test-Path $py) {
-    $site = & $py -c "import site,sys,os; p=(site.getsitepackages() or [os.path.join(sys.prefix,'Lib','site-packages')])[0]; print(p)"
-    $site = $site.Trim()
-    $pth = Join-Path $site "zzz_win_asyncio_policy.pth"
-    $mod = Join-Path $site "win_asyncio_policy.py"
-    foreach ($f in @($pth,$mod)) {
-        if (Test-Path $f) { Remove-Item -Force $f }
-    }
-    Write-Host "Cleaned asyncio override: using default Proactor loop (works with subprocesses)."
-}
-# --------------------------------------------------------------------
