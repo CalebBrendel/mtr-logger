@@ -7,7 +7,7 @@
 #>
 
 param(
-  [string]$InstallerUrl = "https://calebbrendel.com/mtr-logger/windows-p2.ps1",  # point to your main installer
+  [string]$InstallerUrl = "https://calebbrendel.com/mtr-logger/windows-p2.ps1",
   [string]$PythonExeUrl = "https://www.python.org/ftp/python/3.12.5/python-3.12.5-amd64.exe",
   [version]$MinPy = [version]"3.8"
 )
@@ -38,7 +38,7 @@ function Refresh-Path {
   else                 { $env:Path = "" }
 }
 
-# Registry probing for Python installs (HKLM/HKCU, 32/64-bit)
+# Registry probing for Python installs
 function Get-PythonFromRegistry {
   $roots = @(
     "HKLM:\SOFTWARE\Python\PythonCore",
@@ -50,9 +50,8 @@ function Get-PythonFromRegistry {
   foreach ($root in $roots) {
     if (-not (Test-Path $root)) { continue }
     Get-ChildItem $root -ErrorAction SilentlyContinue | ForEach-Object {
-      $verKey = $_.PsPath
       try {
-        $ip = Join-Path $verKey "InstallPath"
+        $ip = Join-Path $_.PsPath "InstallPath"
         if (Test-Path $ip) {
           $props = Get-ItemProperty $ip
           $p = $null
@@ -67,7 +66,7 @@ function Get-PythonFromRegistry {
   $candidates | Select-Object -Unique
 }
 
-# Return a REAL python.exe path without invoking the MS-Store “python” alias
+# Return a REAL python.exe path without invoking the Store alias
 function Resolve-PythonPath {
   # 1) py launcher
   try {
@@ -100,11 +99,12 @@ function Resolve-PythonPath {
   )
   foreach ($p in $common) { if (Test-Path $p) { return $p } }
 
-  # 4) Last resort: python on PATH (only accept if it’s a real file path)
+  # 4) PATH fallback if it's a real file
   try {
     $pcmd = Get-Command python -ErrorAction Stop
     if ($pcmd.Source -and (Test-Path $pcmd.Source)) { return $pcmd.Source }
   } catch {}
+
   return $null
 }
 
@@ -119,7 +119,7 @@ function Install-Python {
     winget install -e --id Python.Python.3 --silent --accept-package-agreements --accept-source-agreements | Out-Null
     Refresh-Path; Start-Sleep -Seconds 2
     if (Resolve-PythonPath) { return }
-    Write-Host "winget reported success, but python.exe is not resolvable yet. Trying EXE fallback..." -ForegroundColor Yellow
+    Write-Host "winget reported success, but python.exe not resolvable yet. Trying EXE fallback..." -ForegroundColor Yellow
   } else {
     Write-Host "winget not available — using official EXE fallback." -ForegroundColor Yellow
   }
