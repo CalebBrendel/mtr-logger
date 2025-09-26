@@ -1,11 +1,8 @@
 <#  windows-onefile.ps1 — One-command Windows installer for mtr-logger (PowerShell 5.1)
-    - Installs Chocolatey (if needed)
-    - Installs Git + curl via Chocolatey
-    - Installs Python 3.13.3 directly from python.org (avoids MSI/GPO vcredist policy blocks)
-    - Removes WindowsApps python stubs (MS Store aliases)
-    - Clones repo, creates venv, installs package (editable)
-    - Adds wrapper to PATH; creates Scheduled Tasks (Log every N minutes; Archive daily)
-    - Provides `mtr-logger uninstall`
+    Changes in this build:
+      * Python EXE install: try All-Users first, then Per-User fallback
+      * Include launcher explicitly; force PATH prepend
+      * Aggressive resolution of python.exe across known locations
 #>
 
 $ErrorActionPreference = 'Stop'
@@ -14,25 +11,25 @@ $ErrorActionPreference = 'Stop'
 $GIT_URL_DEFAULT      = "https://github.com/CalebBrendel/mtr-logger.git"
 $BRANCH_DEFAULT       = "main"
 $PREFIX_DEFAULT       = "C:\mtr-logger"
-$BIN_DIR_DEFAULT      = "C:\mtr-logger\bin"     # gets added to PATH
+$BIN_DIR_DEFAULT      = "C:\mtr-logger\bin"
 
 $TARGET_DEFAULT       = "google.ca"
-$PROTO_DEFAULT        = "icmp"                  # icmp|tcp|udp
+$PROTO_DEFAULT        = "icmp"
 $DNS_DEFAULT          = "auto"
 $INTERVAL_DEFAULT     = "0.3"
 $TIMEOUT_DEFAULT      = "0.3"
 $PROBES_DEFAULT       = "3"
 $ASCII_DEFAULT        = "yes"
 
-$LOGS_PER_HOUR_DEFAULT= 4                       # must divide 60
+$LOGS_PER_HOUR_DEFAULT= 4
 $SAFETY_MARGIN_DEFAULT= 5
-$ARCHIVE_RETENTION_DEFAULT = 90                 # days
+$ARCHIVE_RETENTION_DEFAULT = 90
 
-# Python to install (direct EXE)
+# Python EXE
 $PY_VERSION = "3.13.3"
 $PY_EXE_URL = "https://www.python.org/ftp/python/$PY_VERSION/python-$PY_VERSION-amd64.exe"
 
-# ----------------- Derived (recomputed after prompts) -----------------
+# Derived (recomputed after prompts)
 $SRC_DIR   = Join-Path $PREFIX_DEFAULT "src"
 $VENV_DIR  = Join-Path $PREFIX_DEFAULT ".venv"
 $WRAPPER_PS= Join-Path $BIN_DIR_DEFAULT "mtr-logger.ps1"
@@ -71,20 +68,22 @@ function Remove-StorePythonStubs {
   }
 }
 function Resolve-Python {
-  # Prefer py launcher if present
+  # 1) Preferred: py launcher
   try {
     Get-Command py -ErrorAction Stop | Out-Null
     $p = & py -3 -c "import sys,os;print(sys.executable if os.path.exists(sys.executable) else '')" 2>$null
     if ($p) { $p=$p.Trim(); if (Test-Path $p) { return $p } }
   } catch {}
-  # Common locations
+
+  # 2) Probe canonical locations
   $cands=@(
     "C:\Program Files\Python313\python.exe","C:\Program Files\Python312\python.exe","C:\Program Files\Python311\python.exe","C:\Program Files\Python310\python.exe",
     "C:\Python313\python.exe","C:\Python312\python.exe","C:\Python311\python.exe","C:\Python310\python.exe",
     "$env:LOCALAPPDATA\Programs\Python\Python313\python.exe","$env:LOCALAPPDATA\Programs\Python\Python312\python.exe","$env:LOCALAPPDATA\Programs\Python\Python311\python.exe","$env:LOCALAPPDATA\Programs\Python\Python310\python.exe"
   )
   foreach ($c in $cands) { if (Test-Path $c) { return $c } }
-  # PATH (only if it’s a real file)
+
+  # 3) PATH (only if real file)
   try { $pc=Get-Command python -ErrorAction Stop; if($pc.Source -and (Test-Path $pc.Source)){ return $pc.Source } } catch {}
   return $null
 }
@@ -95,8 +94,6 @@ function Check-PyVersion([string]$PyExe, [version]$MinVersion = [version]"3.8") 
   if ([version]$v -lt $MinVersion) { throw "Python $v is below required minimum $MinVersion" }
   return $true
 }
-
-# ----------------- Chocolatey + deps -----------------
 function Ensure-Choco {
   if (-not (Get-Command choco.exe -ErrorAction SilentlyContinue)) {
     Write-Host "Installing Chocolatey..."
@@ -112,29 +109,37 @@ function Ensure-GitCurl {
   Refresh-Path
 }
 
-# ----------------- Python (direct EXE) -----------------
+# --- Install Python via EXE: All-Users, then Per-User fallback ---
 function Ensure-PythonDirect {
-  # Remove WindowsApps stubs first to avoid alias hijack
   Remove-StorePythonStubs
   Refresh-Path
 
-  # If already present, skip
+  # Already present?
   $existing = Resolve-Python
   if ($existing) { return $existing }
 
-  # Download + install official Python
   $tmp = Join-Path $env:TEMP ("python-"+$PY_VERSION+"-"+[guid]::NewGuid().ToString()+".exe")
   Write-Host "Downloading Python $PY_VERSION ..."
   Invoke-WebRequest -UseBasicParsing -Uri $PY_EXE_URL -OutFile $tmp
-  Write-Host "Installing Python (silent)..."
-  Start-Process $tmp -ArgumentList "/quiet InstallAllUsers=1 PrependPath=1 Include_test=0" -Wait
-  try { Remove-Item $tmp -Force } catch {}
 
-  # Refresh PATH and resolve concrete exe
-  Refresh-Path
-  Start-Sleep -Seconds 2
+  # Try All-Users first (Program Files)
+  Write-Host "Installing Python (All-Users, silent)..."
+  $args = "/quiet InstallAllUsers=1 PrependPath=1 Include_test=0 Include_launcher=1 InstallLauncherAllUsers=1"
+  Start-Process $tmp -ArgumentList $args -Wait
+  Refresh-Path; Start-Sleep -Seconds 2
   $py = Resolve-Python
-  if (-not $py) { throw "Python installation completed but not visible in this session. Open a new elevated PowerShell and rerun, or re-run this script." }
+  if ($py) { try { Remove-Item $tmp -Force } catch {}; return $py }
+
+  # Fallback: Per-User install (LocalAppData)
+  Write-Host "All-Users install not visible; retrying Per-User install..."
+  $argsPU = "/quiet InstallAllUsers=0 PrependPath=1 Include_test=0 Include_launcher=1"
+  Start-Process $tmp -ArgumentList $argsPU -Wait
+  Refresh-Path; Start-Sleep -Seconds 2
+  $py = Resolve-Python
+  try { Remove-Item $tmp -Force } catch {}
+  if (-not $py) {
+    throw "Python installation completed but python.exe not resolvable to this session."
+  }
   return $py
 }
 
@@ -182,7 +187,6 @@ $LPH      = [int](Read-Default "How many logs per hour (must divide 60 evenly)" 
 if (-not (Validate-FactorOf60 $LPH)) { Write-Host "ERROR: $LPH does not evenly divide 60." -ForegroundColor Red; exit 2 }
 $SAFETY   = [int](Read-Default "Safety margin seconds (subtract from each window)" "$SAFETY_MARGIN_DEFAULT")
 
-# recompute derived
 $SRC_DIR  = Join-Path $PREFIX "src"
 $VENV_DIR = Join-Path $PREFIX ".venv"
 $WRAPPER_PS = Join-Path $BIN_DIR "mtr-logger.ps1"
@@ -232,7 +236,6 @@ Write-Host "[8/12] Installing package (editable)..."
 Write-Host "[9/12] Creating wrapper + uninstall in $BIN_DIR"
 Ensure-Dir $BIN_DIR
 
-# uninstall.ps1
 @"
 param()
 Write-Host "This will uninstall mtr-logger:" -ForegroundColor Yellow
@@ -263,7 +266,6 @@ if (`$del -and `$del.ToLower() -in @('y','yes')) {
 Write-Host "[5/5] Uninstall complete."
 "@ | Set-Content -Encoding UTF8 $UNINSTALL_PS
 
-# mtr-logger.ps1 (PowerShell entry)
 @"
 param([Parameter(ValueFromRemainingArguments=`$true)]`$Args)
 if (`$Args.Count -gt 0 -and `$Args[0].ToString().ToLower() -eq 'uninstall') {
@@ -273,7 +275,6 @@ if (`$Args.Count -gt 0 -and `$Args[0].ToString().ToLower() -eq 'uninstall') {
 & "$VENV_PY" -m mtrpy @Args
 "@ | Set-Content -Encoding UTF8 $WRAPPER_PS
 
-# mtr-logger.cmd (CMD shim; friendlier on default ExecutionPolicy)
 @"
 @echo off
 set VENV=$VENV_DIR
@@ -284,7 +285,6 @@ if /I "%~1"=="uninstall" (
 "%VENV%\Scripts\python.exe" -m mtrpy %*
 "@ | Set-Content -Encoding OEM $WRAPPER_CMD
 
-# Add $BIN_DIR to PATH (system)
 Write-Host "[10/12] Ensuring $BIN_DIR on system PATH..."
 $curPath = [Environment]::GetEnvironmentVariable("Path","Machine")
 if (-not ($curPath -split ';' | Where-Object { $_ -ieq $BIN_DIR })) {
@@ -298,17 +298,16 @@ Ensure-Dir $LOG_DIR
 $logOut = Join-Path $env:USERPROFILE "mtr-logger.log"
 $archOut= Join-Path $env:USERPROFILE "mtr-logger-archive.log"
 
-# Repeat every stepMin minutes
+$stepMin = [int](60 / $LPH)
 $logCmd = "`"$WRAPPER_CMD`" `"$TARGET`" --proto `"$PROTO`" --dns `"$DNS_MODE`" -i `"$INTERVAL`" --timeout `"$TIMEOUT`" -p `"$PROBES`" --duration $duration --export --outfile auto >> `"$logOut`" 2>&1"
 schtasks /Delete /TN "$MAIN_TASK" /F 2>$null | Out-Null
 schtasks /Create /TN "$MAIN_TASK" /TR $logCmd /SC MINUTE /MO $stepMin /RU "SYSTEM" /RL HIGHEST /F | Out-Null
 
-# Archiver daily 00:00
 $archCmd = "`"$VENV_PY`" -m mtrpy.archiver --retention $ARCHIVE_RETENTION_DEFAULT >> `"$archOut`" 2>&1"
 schtasks /Delete /TN "$ARCH_TASK" /F 2>$null | Out-Null
 schtasks /Create /TN "$ARCH_TASK" /TR $archCmd /SC DAILY /ST 00:00 /RU "SYSTEM" /RL HIGHEST /F | Out-Null
 
-# Self-test (non-fatal)
+# Self-test
 Write-Host "[12/12] Self-test..."
 try {
   & $WRAPPER_CMD $TARGET --proto $PROTO --dns $DNS_MODE -i $INTERVAL --timeout $TIMEOUT -p $PROBES --duration 5 --export --outfile auto | Out-Null
@@ -319,13 +318,7 @@ try {
 
 Write-Host ""
 Write-Host "✅ Install complete."
-Write-Host ""
 Write-Host "Run interactively (new terminal recommended so PATH reloads):"
 Write-Host "  mtr-logger $TARGET --proto $PROTO -i $INTERVAL --timeout $TIMEOUT -p $PROBES"
-Write-Host ""
-Write-Host "Uninstall anytime:"
-Write-Host "  mtr-logger uninstall"
-Write-Host ""
-Write-Host "Notes:"
-Write-Host " - Logs: $LOG_DIR"
-Write-Host " - Tasks: '$MAIN_TASK' (every $stepMin min), '$ARCH_TASK' (daily 00:00)"
+Write-Host "Uninstall anytime:  mtr-logger uninstall"
+Write-Host "Logs: $LOG_DIR"
