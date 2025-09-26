@@ -12,7 +12,6 @@ cat <<'LOGO'
       \/                         /_____//_____/      \/        
 LOGO
 }
-# ----------------------------------------
 
 # ----------------- Defaults -----------------
 GIT_URL_DEFAULT="https://github.com/CalebBrendel/mtr-logger.git"
@@ -35,30 +34,39 @@ SAFETY_MARGIN_DEFAULT="5"
 ARCHIVE_RETENTION_DEFAULT="90"
 # --------------------------------------------
 
-# ----------------- Helpers -----------------
+# ------------- Prompt helpers (TTY-safe) -------------
 sanitize_input() {
-  # strip ANSI + non-printable + trim
   sed -E 's/\x1B\[[0-9;]*[A-Za-z]//g' | tr -cd '\11\12\15\40-\176' | sed -E 's/^[[:space:]]+//; s/[[:space:]]+$//'
 }
-is_valid_git_url(){ case "${1:-}" in https://*|git@*:* ) return 0;; *) return 1;; esac; }
-ask(){
-  local l="$1" d="$2" a=""
-  if [[ -t 0 ]]; then read -r -p "$l [$d]: " a; else read -r -p "$l [$d]: " a < /dev/tty; fi
-  a="$(printf "%s" "${a:-$d}" | sanitize_input)"
-  printf "%s\n" "$a"
+_read_tty() {
+  local prompt="$1" default="${2:-}"
+  local ans=""
+  if [[ -t 0 ]]; then
+    read -r -p "$prompt" ans
+  else
+    # stdin is a pipe; read from real terminal
+    read -r -p "$prompt" ans < /dev/tty
+  fi
+  ans="${ans:-$default}"
+  printf "%s\n" "$(printf "%s" "$ans" | sanitize_input)"
+}
+ask() { _read_tty "$1 [$2]: " "$2"; }
+ask_raw() { _read_tty "$1" ""; }
+ask_yn() {
+  local q="$1" def="${2:-Y}"
+  local d="$(printf "%s" "$def" | tr '[:lower:]' '[:upper:]')"
+  local ans="$( _read_tty "$q [${d}]: " "$d" )"
+  case "${ans,,}" in y|yes) echo "Y";; n|no) echo "N";; *) echo "$d";; esac
 }
 require_root(){ [[ ${EUID:-$(id -u)} -eq 0 ]] || { echo "Please run as root (sudo)."; exit 1; }; }
 
+# ------------- System helpers -------------
 detect_pm(){
-  if command -v apt-get >/dev/null 2>&1; then echo apt
-  elif command -v dnf >/dev/null 2>&1; then echo dnf
-  elif command -v yum >/dev/null 2>&1; then echo yum
-  elif command -v zypper >/dev/null 2>&1; then echo zypper
-  elif command -v pacman >/dev/null 2>&1; then echo pacman
-  elif command -v apk >/dev/null 2>&1; then echo apk
+  if command -v apt-get >/dev/null 2>&1; then echo apt; elif command -v dnf >/dev/null 2>&1; then echo dnf;
+  elif command -v yum >/dev/null 2>&1; then echo yum; elif command -v zypper >/dev/null 2>&1; then echo zypper;
+  elif command -v pacman >/dev/null 2>&1; then echo pacman; elif command -v apk >/dev/null 2>&1; then echo apk;
   else echo none; fi
 }
-
 install_deps(){
   local pm="$1"; echo "[1/12] Installing system dependencies (pm: $pm)..."
   case "$pm" in
@@ -71,7 +79,6 @@ install_deps(){
     *) echo "Unsupported distro. Install python3, venv, pip, git, traceroute, curl, cron, libcap manually."; exit 1 ;;
   esac
 }
-
 start_cron_service(){
   echo "[2/12] Ensuring cron service is enabled and running..."
   local ok=0
@@ -98,24 +105,15 @@ start_cron_service(){
     rc-update add crond default >/dev/null 2>&1 || rc-update add cron default >/dev/null 2>&1 || true
     rc-service crond start >/dev/null 2>&1 || rc-service cron start >/dev/null 2>&1 || true
   fi
-  if pgrep -x cron >/dev/null 2>&1 || pgrep -x crond >/dev/null 2>&1; then
-    echo "    - cron/crond is running"
-  else
-    echo "    - Could not verify an active cron unit; please check manually."
-  fi
+  if pgrep -x cron >/dev/null 2>&1 || pgrep -x crond >/dev/null 2>&1; then echo "    - cron/crond is running"; else echo "    - Could not verify an active cron unit; please check manually."; fi
 }
 
 validate_factor_of_60(){ case "$1" in 1|2|3|4|5|6|10|12|15|20|30|60) return 0;; *) return 1;; esac; }
 
-# split variable assignments so set -u doesn't complain
 minutes_list(){
-  local n="$1"
-  local step; step=$((60 / n))
-  local out=""; local m=0
-  while (( m < 60 )); do
-    out+="${m},"
-    m=$((m + step))
-  done
+  local n="$1" step out="" m=0
+  step=$((60 / n))
+  while (( m < 60 )); do out+="${m},"; m=$((m + step)); done
   printf '%s\n' "${out%,}"
 }
 
@@ -131,6 +129,7 @@ try_setcap_cap_net_raw(){
 
 detect_current_tz(){
   if command -v timedatectl >/dev/null 2>&1; then
+    local tz
     tz="$(timedatectl show -p Timezone --value 2>/dev/null || true)"
     [[ -n "${tz:-}" ]] && { printf "%s\n" "$tz"; return; }
   fi
@@ -138,58 +137,148 @@ detect_current_tz(){
   echo "UTC"
 }
 
-# ---- Timezone confirm/change (clear, with preview) ----
-confirm_or_change_timezone() {
-  echo
-  CUR_TZ="$(detect_current_tz)"
-  echo "[TZ] Detected host timezone: ${CUR_TZ}"
-  read -r -p "Is this the correct timezone? [Y/n]: " ans
-  ans="${ans:-Y}"
-
-  if [[ "$ans" =~ ^[Nn]$ ]]; then
-    read -r -p "Do you want to change the system timezone now? [Y/n]: " ch
-    ch="${ch:-Y}"
-    if [[ "$ch" =~ ^[Yy]$ ]]; then
-      echo
-      echo "Enter an exact IANA timezone (e.g., America/Chicago)."
-      echo "Tip: run 'timedatectl list-timezones | less' in another terminal to browse."
-      while :; do
-        read -r -p "Timezone: " NEW_TZ
-        NEW_TZ="$(printf "%s" "${NEW_TZ:-}" | sed -E 's/^[[:space:]]+//; s/[[:space:]]+$//')"
-        if [[ -z "$NEW_TZ" ]]; then
-          echo "No timezone entered; skipping change."
-          break
-        fi
-        if timedatectl list-timezones 2>/dev/null | grep -Fxq "$NEW_TZ"; then
-          PREVIEW="$(TZ="$NEW_TZ" date '+%Y-%m-%d %H:%M:%S %Z')"
-          echo "Preview for $NEW_TZ: $PREVIEW"
-          read -r -p "Apply this timezone? [Y/n]: " ok
-          ok="${ok:-Y}"
-          if [[ "$ok" =~ ^[Yy]$ ]]; then
-            if command -v timedatectl >/dev/null 2>&1; then
-              timedatectl set-timezone "$NEW_TZ" || {
-                echo "timedatectl failed; trying /etc/localtime symlink..."
-                ln -sf "/usr/share/zoneinfo/$NEW_TZ" /etc/localtime
-              }
-            else
-              ln -sf "/usr/share/zoneinfo/$NEW_TZ" /etc/localtime
-            fi
-            echo "Timezone set to $NEW_TZ"
-          else
-            echo "Timezone change aborted."
-          fi
-          break
-        else
-          echo "‘$NEW_TZ’ is not a valid timezone on this system."
-          echo "Try again, or press Enter to skip."
-        fi
-      done
-    fi
+tz_list() {
+  if command -v timedatectl >/dev/null 2>&1; then
+    timedatectl list-timezones 2>/dev/null || true
+  elif [[ -d /usr/share/zoneinfo ]]; then
+    # Filter out non-zones
+    find /usr/share/zoneinfo -type f \
+      | sed -e 's|^/usr/share/zoneinfo/||' \
+      | grep -Ev '(^posix/|^right/|/Etc/|^Etc/UTC$|\.tab$|leapseconds|zone1970\.tab|zoneinfo\.dir|zoneinfo\.tzdata)' \
+      || true
   fi
-  echo
 }
-# -------------------------------------------------------
 
+show_local_time_preview(){
+  local tz="$1"
+  if [[ -n "$tz" ]]; then
+    TZ="$tz" date "+%Y-%m-%d %H:%M:%S %Z (preview)"
+  fi
+}
+
+choose_timezone_with_menu(){
+  local detected="$1"
+  echo
+  echo "[TZ] Detected host timezone: $detected"
+  local yn
+  yn="$(ask_yn 'Is this the correct timezone?' 'Y')"
+  if [[ "$yn" == "Y" ]]; then
+    echo "    - Keeping system timezone as: $detected"
+    CRON_TZ_VAL="$detected"
+    return 0
+  fi
+
+  echo
+  echo "Choose how to set timezone:"
+  echo "  1) Use detected timezone ($detected)"
+  echo "  2) Enter exact IANA name (e.g., America/Chicago)"
+  echo "  3) Browse by Region (e.g., America → Chicago)"
+  echo "  4) Search by keyword (shows matches)"
+  echo "  5) Skip timezone change"
+  while :; do
+    local opt; opt="$(ask 'Option' '4')"
+    case "$opt" in
+      1)
+        echo "    - Using detected timezone: $detected"
+        CRON_TZ_VAL="$detected"
+        break
+        ;;
+      2)
+        local tz_exact; tz_exact="$(ask_raw 'Enter exact IANA timezone: ')"
+        if [[ -z "$tz_exact" ]]; then echo "    - Empty, try again."; continue; fi
+        if tz_list | grep -Fxq "$tz_exact"; then
+          echo "Preview: $(show_local_time_preview "$tz_exact")"
+          if [[ "$(ask_yn "Use this timezone?" 'Y')" == "Y" ]]; then
+            apply_timezone "$tz_exact"
+            CRON_TZ_VAL="$tz_exact"
+            break
+          fi
+        else
+          echo "    - Not found in system TZ database. Try again."
+        fi
+        ;;
+      3)
+        browse_timezone && break || true
+        ;;
+      4)
+        search_timezone && break || true
+        ;;
+      5)
+        echo "    - Skipping timezone change."
+        CRON_TZ_VAL="$detected"
+        break
+        ;;
+      *)
+        echo "    - Invalid option. Choose 1–5."
+        ;;
+    esac
+  done
+}
+
+apply_timezone(){
+  local tz="$1"
+  echo "Applying timezone: $tz"
+  if command -v timedatectl >/dev/null 2>&1; then
+    timedatectl set-timezone "$tz" || echo "WARNING: timedatectl failed; continuing."
+  elif [[ -f "/usr/share/zoneinfo/$tz" ]]; then
+    ln -sf "/usr/share/zoneinfo/$tz" /etc/localtime || true
+    printf "%s\n" "$tz" > /etc/timezone || true
+  else
+    echo "WARNING: Could not set timezone automatically."
+  fi
+}
+
+browse_timezone(){
+  echo
+  echo "Browse by Region:"
+  local regions
+  regions="$(tz_list | awk -F'/' 'NF>1{print $1}' | sort -u)"
+  if [[ -z "$regions" ]]; then echo "    - No region list available."; return 1; fi
+  echo "$regions" | nl -w2 -s'. '
+  local idx; idx="$(ask 'Pick region number' '')"
+  if ! [[ "$idx" =~ ^[0-9]+$ ]]; then echo "    - Invalid number."; return 1; fi
+  local region; region="$(echo "$regions" | sed -n "${idx}p")"
+  if [[ -z "$region" ]]; then echo "    - Invalid selection."; return 1; fi
+  local zones; zones="$(tz_list | grep -E "^${region}/")"
+  if [[ -z "$zones" ]]; then echo "    - No zones under region."; return 1; fi
+  echo
+  echo "Zones under $region:"
+  echo "$zones" | nl -w2 -s'. '
+  local zidx; zidx="$(ask 'Pick zone number' '')"
+  if ! [[ "$zidx" =~ ^[0-9]+$ ]]; then echo "    - Invalid number."; return 1; fi
+  local choice; choice="$(echo "$zones" | sed -n "${zidx}p")"
+  if [[ -z "$choice" ]]; then echo "    - Invalid selection."; return 1; fi
+  echo "Preview: $(show_local_time_preview "$choice")"
+  if [[ "$(ask_yn "Use this timezone?" 'Y')" == "Y" ]]; then
+    apply_timezone "$choice"
+    CRON_TZ_VAL="$choice"
+    return 0
+  fi
+  return 1
+}
+
+search_timezone(){
+  echo
+  local kw; kw="$(ask 'Search keyword (e.g., Chicago)' '')"
+  if [[ -z "$kw" ]]; then echo "    - Empty search."; return 1; fi
+  local matches; matches="$(tz_list | grep -i "$kw" || true)"
+  if [[ -z "$matches" ]]; then echo "    - No matches."; return 1; fi
+  echo
+  echo "Matches:"
+  echo "$matches" | nl -w2 -s'. '
+  local pick; pick="$(ask 'Enter exact timezone from the list (or leave blank to cancel)' '')"
+  if [[ -z "$pick" ]]; then echo "    - Cancelled."; return 1; fi
+  if ! (echo "$matches" | grep -Fxq "$pick"); then echo "    - Not in shown list."; return 1; fi
+  echo "Preview: $(show_local_time_preview "$pick")"
+  if [[ "$(ask_yn "Use this timezone?" 'Y')" == "Y" ]]; then
+    apply_timezone "$pick"
+    CRON_TZ_VAL="$pick"
+    return 0
+  fi
+  return 1
+}
+
+# -------------------- Main flow --------------------
 main(){
   require_root
   print_logo
@@ -199,10 +288,13 @@ main(){
   install_deps "$PM"
   start_cron_service
 
-  # NEW: confirm or change timezone here (before git prompts)
-  confirm_or_change_timezone
+  # --- Timezone block (before any Git work) ---
+  CURRENT_TZ="$(detect_current_tz)"
+  CRON_TZ_VAL="$CURRENT_TZ"
+  choose_timezone_with_menu "$CURRENT_TZ"
 
-  GIT_URL="$(ask "Git URL" "$GIT_URL_DEFAULT")"; is_valid_git_url "$GIT_URL" || { echo "WARNING: invalid URL; using default."; GIT_URL="$GIT_URL_DEFAULT"; }
+  # --- Standard prompts / install ---
+  GIT_URL="$(ask "Git URL" "$GIT_URL_DEFAULT")"; case "$GIT_URL" in https://*|git@*:* ) ;; *) echo "WARNING: invalid URL; using default."; GIT_URL="$GIT_URL_DEFAULT";; esac
   BRANCH="$(ask "Branch" "$BRANCH_DEFAULT")"
   PREFIX="$(ask "Install prefix" "$PREFIX_DEFAULT")"
   WRAPPER="$(ask "Wrapper path" "$WRAPPER_DEFAULT")"
@@ -216,9 +308,6 @@ main(){
   FPS="$(ask "TUI FPS (interactive only)" "$FPS_DEFAULT")"
   ASCII="$(ask "Use ASCII borders? (yes/no)" "$ASCII_DEFAULT")"
   USE_SCREEN="$(ask "Use alternate screen? (yes/no)" "$USE_SCREEN_DEFAULT")"
-
-  CURRENT_TZ="$(detect_current_tz)"
-  CRON_TZ_VAL="$(ask "Time zone for scheduling (IANA, e.g. America/Chicago)" "$CURRENT_TZ")"
 
   LPH="$(ask "How many logs per hour (must divide 60 evenly)" "$LOGS_PER_HOUR_DEFAULT")"
   validate_factor_of_60 "$LPH" || { echo "ERROR: $LPH does not evenly divide 60."; exit 2; }
@@ -314,5 +403,8 @@ Notes:
 - Retention is 90 days by default; edit root crontab to change.
 INFO
 }
+
+# Export CRON_TZ_VAL default to quiet shellcheck warnings
+CRON_TZ_VAL="UTC"
 
 main "$@"
