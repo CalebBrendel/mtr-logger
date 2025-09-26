@@ -1,20 +1,19 @@
 <#  bootstrap_mtr-logger.ps1
-    One-go Windows setup for mtr-logger:
-      1) Ensure elevation & TLS 1.2
-      2) Install Python 3 (winget -> official EXE fallback)
-      3) Verify a real python.exe exists (not MS Store alias)
-      4) Download and run your main installer script
-    PowerShell 5.1 compatible
+    One-go Windows setup for mtr-logger (PowerShell 5.1 compatible)
+    1) Ensure elevation & TLS 1.2
+    2) Install Python 3 (winget -> official EXE fallback)
+    3) Verify a real python.exe (not MS Store alias), check version
+    4) Download and run your main installer script
 #>
 
 param(
   # Your main installer (PS 5.1–compatible) URL:
   [string]$InstallerUrl = "https://calebbrendel.com/mtr-logger/windowsp2",
 
-  # Fallback Python EXE (adjust if you need another version)
+  # Fallback Python EXE (adjust if you prefer another version)
   [string]$PythonExeUrl = "https://www.python.org/ftp/python/3.12.5/python-3.12.5-amd64.exe",
 
-  # Minimum acceptable Python major.minor (just in case)
+  # Minimum acceptable Python version
   [version]$MinPy = [version]"3.8"
 )
 
@@ -37,9 +36,9 @@ function Refresh-Path {
               [Environment]::GetEnvironmentVariable('Path','User')
 }
 
-# Resolve a REAL python.exe path (not the MS Store alias)
+# Return a **real** python.exe path (avoid MS Store alias)
 function Resolve-PythonPath {
-  # Try py launcher enumerations first
+  # Try py launcher enumeration first
   try {
     $pyCmd = Get-Command py -ErrorAction Stop
     $list = & py -0p 2>$null
@@ -49,9 +48,9 @@ function Resolve-PythonPath {
         if ($exe -and (Test-Path $exe) -and ($exe -like "*\python.exe")) { return $exe }
       }
     }
-    # Fallback: ask py -3 for concrete executable
+    # Fallback: ask py -3 for the executable
     try {
-      $p = & py -3 -c "import sys;print(sys.executable)" 2>$null
+      $p = & py -3 -c "import sys; print(sys.executable)" 2>$null
       if ($p) { $p = $p.Trim(); if (Test-Path $p) { return $p } }
     } catch {}
   } catch {}
@@ -81,7 +80,6 @@ function Resolve-PythonPath {
 }
 
 function Install-Python {
-  # If already resolvable, we’re good
   if (Resolve-PythonPath) { return }
 
   $haveWinget = $false
@@ -93,7 +91,7 @@ function Install-Python {
     Refresh-Path
     Start-Sleep -Seconds 2
     if (Resolve-PythonPath) { return }
-    Write-Host "winget reported success, but Python isn't resolvable yet. Will try EXE fallback..." -ForegroundColor Yellow
+    Write-Host "winget reported success, but Python isn’t resolvable yet. Trying EXE fallback..." -ForegroundColor Yellow
   } else {
     Write-Host "winget not available—using EXE fallback." -ForegroundColor Yellow
   }
@@ -114,19 +112,11 @@ function Install-Python {
 
 function Check-Python-Version {
   param([string]$PyPath)
-  try {
-    $v = & $PyPath - << 'PY'
-import sys
-print(".".join(map(str, sys.version_info[:3])))
-PY
-    $v = ($v | Select-Object -First 1).Trim()
-    if ($v -match '^\d+\.\d+(\.\d+)?$') {
-      if ([version]$v -lt $MinPy) {
-        throw "Python $v is below the required minimum of $MinPy."
-      }
-      return $true
-    }
-  } catch { throw $_ }
+  $v = & $PyPath -c "import sys; print('.'.join(map(str, sys.version_info[:3])))"
+  $v = ($v | Select-Object -First 1).Trim()
+  if (-not ($v -match '^\d+\.\d+(\.\d+)?$')) { throw "Could not parse Python version string: '$v'" }
+  if ([version]$v -lt $MinPy) { throw "Python $v is below the required minimum of $MinPy." }
+  return $true
 }
 
 function Run-Installer {
@@ -145,16 +135,11 @@ Write-Host "== mtr-logger one-go bootstrap =="
 Write-Host "[1/3] Ensuring Python is installed..."
 Install-Python
 
-# Verify a concrete python.exe and basic version
 $PythonExe = Resolve-PythonPath
-if (-not $PythonExe) {
-  throw "Python still not resolvable after installation. Open a new elevated PowerShell and rerun this script."
-}
+if (-not $PythonExe) { throw "Python still not resolvable after installation. Open a new elevated PowerShell and rerun this script." }
+
 Check-Python-Version -PyPath $PythonExe | Out-Null
 Write-Host ("    - Using Python: {0}" -f $PythonExe)
-
-# IMPORTANT: do NOT call `python`/`py` in this step to avoid MS Store alias noise.
-# The main installer does its own env/venv work anyway.
 
 Write-Host "[2/3] Refreshing PATH for this session..."
 Refresh-Path
