@@ -1,9 +1,8 @@
 <#  windows-onefile.ps1 — One-command Windows installer for mtr-logger (PowerShell 5.1)
-    v6.3:
-      - FIX: pip bootstrap uses call operator with PS redirection (no Start-Process log clash)
-      - Idempotent embeddable reuse; pip repair if missing
-      - Safe Scheduled Tasks (ignore missing on delete)
-      - EXE-first Python install; fallback to embeddable ZIP
+    v6.4:
+      - Robust Ensure-Embeddable-Pip: always enable 'import site', run get-pip directly, verify, show tail on fail
+      - Uses EXE installer first; falls back to embeddable ZIP
+      - Safe Scheduled Tasks; idempotent reruns
 #>
 
 $ErrorActionPreference = 'Stop'
@@ -201,41 +200,43 @@ function Install-Python-Embeddable {
     Set-Content -Path $pth -Value $content -Encoding ASCII
   }
 
-  # Bootstrap pip (call operator + PS redirection to combine streams)
+  # Bootstrap pip (no Start-Process; let errors surface)
   Write-Host "Bootstrapping pip inside embeddable..."
   $getpip = Join-Path $env:TEMP ("get-pip-"+[guid]::NewGuid().ToString()+".py")
   Invoke-WebRequest -UseBasicParsing -Uri $GET_PIP_URL -OutFile $getpip
   $pyexe = Join-Path $EMB_DIR "python.exe"
-  & $pyexe $getpip --no-warn-script-location *> $pipLog
+  & $pyexe $getpip --no-warn-script-location
   try { Remove-Item $getpip -Force } catch {}
 
   # Verify pip actually installed
-  $pipOk = $false
-  try {
-    $ver = & $pyexe -m pip --version 2>$null
-    if ($LASTEXITCODE -eq 0 -and $ver) { $pipOk = $true }
-  } catch { $pipOk = $false }
-  if (-not $pipOk) {
-    Write-Host "get-pip output (tail): $pipLog" -ForegroundColor Yellow
-    try { Get-Content -Path $pipLog -Tail 80 | ForEach-Object { Write-Host "  $_" } } catch {}
-    throw "pip did not install correctly in embeddable runtime."
-  }
+  & $pyexe -m pip --version
+  if ($LASTEXITCODE -ne 0) { throw "pip did not install correctly in embeddable runtime." }
 
   # Quietly ensure wheel
-  & $pyexe -m pip install -U pip wheel --no-warn-script-location *> $pipLog
+  & $pyexe -m pip install -U pip wheel --no-warn-script-location | Out-Null
 
   return $pyexe
 }
 
 function Ensure-Embeddable-Pip([string]$PyExe) {
+  $root = Split-Path -Parent $PyExe
+  # 1) Always ensure 'import site' is enabled
+  $pth = Get-ChildItem -Path $root -Filter "python*.pth" -File | Select-Object -First 1
+  if ($pth) {
+    $content = Get-Content $pth
+    $new = $content -replace '^\s*#\s*import site\s*$', 'import site'
+    if ($new -ne $content) { Set-Content -Path $pth -Value $new -Encoding ASCII }
+  }
+  # 2) If pip missing, run get-pip once (no redirects)
   try {
     & $PyExe -m pip --version 2>$null | Out-Null
     if ($LASTEXITCODE -eq 0) { return }
   } catch {}
   Write-Host "pip not found in embeddable — installing now..."
-  $pipLog= Join-Path $env:TEMP ("getpip-repair-"+(Get-Date -Format "yyyyMMdd-HHmmss")+".log")
   $getpip = Join-Path $env:TEMP ("get-pip-"+[guid]::NewGuid().ToString()+".py")
+  $pipLog = Join-Path $env:TEMP ("getpip-repair-"+(Get-Date -Format "yyyyMMdd-HHmmss")+".log")
   Invoke-WebRequest -UseBasicParsing -Uri $GET_PIP_URL -OutFile $getpip
+  # capture both streams to a log via *> for troubleshooting
   & $PyExe $getpip --no-warn-script-location *> $pipLog
   try { Remove-Item $getpip -Force } catch {}
   & $PyExe -m pip --version 2>$null | Out-Null
