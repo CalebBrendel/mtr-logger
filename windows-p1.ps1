@@ -1,8 +1,9 @@
 <#  windows-onefile.ps1 — One-command Windows installer for mtr-logger (PowerShell 5.1)
-    v5:
-      - If Python EXE install fails or is blocked (MSI 1625 / 0x659), fallback to the
-        official **embeddable Python ZIP** (no MSI, no policy), enable site, bootstrap pip,
-        and continue using that interpreter.
+    v6:
+      - Robust embeddable Python bootstrapping:
+        * get-pip output fully redirected to a log (no console bleed that confuses IEX)
+        * verifies pip presence; shows log tail on failure
+      - Keeps EXE install attempt first; falls back on policy block (0x659)
 #>
 
 $ErrorActionPreference = 'Stop'
@@ -25,7 +26,7 @@ $LOGS_PER_HOUR_DEFAULT= 4
 $SAFETY_MARGIN_DEFAULT= 5
 $ARCHIVE_RETENTION_DEFAULT = 90
 
-# Python downloads (adjust version in one place)
+# Python downloads
 $PY_VERSION = "3.13.3"
 $PY_EXE_URL  = "https://www.python.org/ftp/python/$PY_VERSION/python-$PY_VERSION-amd64.exe"
 $PY_ZIP_URL  = "https://www.python.org/ftp/python/$PY_VERSION/python-$PY_VERSION-embed-amd64.zip"
@@ -33,8 +34,8 @@ $GET_PIP_URL = "https://bootstrap.pypa.io/get-pip.py"
 
 # Derived (recomputed after prompts)
 $SRC_DIR   = Join-Path $PREFIX_DEFAULT "src"
-$VENV_DIR  = Join-Path $PREFIX_DEFAULT ".venv"   # used if full Python is installed
-$EMB_DIR   = Join-Path $PREFIX_DEFAULT "pyembed" # used for embed fallback
+$VENV_DIR  = Join-Path $PREFIX_DEFAULT ".venv"   # full Python
+$EMB_DIR   = Join-Path $PREFIX_DEFAULT "pyembed" # embeddable fallback
 $WRAPPER_PS= Join-Path $BIN_DIR_DEFAULT "mtr-logger.ps1"
 $WRAPPER_CMD=Join-Path $BIN_DIR_DEFAULT "mtr-logger.cmd"
 $UNINSTALL_PS = Join-Path $BIN_DIR_DEFAULT "uninstall.ps1"
@@ -136,7 +137,7 @@ function Ensure-Choco {
   if (-not (Get-Command choco.exe -ErrorAction SilentlyContinue)) {
     Write-Host "Installing Chocolatey..."
     Set-ExecutionPolicy Bypass -Scope Process -Force
-    [System.Net.ServicePointManager]::SecurityProtocol = [System.Net.SecurityProtocolType]::Tls12
+    [System.Net.ServicePointManager]::SecurityProtocol = [System.Net.SecurityType]::Tls12
     Invoke-Expression ((New-Object System.Net.WebClient).DownloadString('https://community.chocolatey.org/install.ps1'))
     $env:Path += ";$env:ALLUSERSPROFILE\chocolatey\bin"
   }
@@ -147,7 +148,7 @@ function Ensure-GitCurl {
   Refresh-Path
 }
 
-# --- Install Python via EXE with logging; fallback to embeddable ZIP if needed ---
+# --- Install Python via EXE; fallback to embeddable ZIP ---
 function Install-Python-EXE {
   Remove-StorePythonStubs; Refresh-Path
   $tmp = Join-Path $env:TEMP ("python-"+$PY_VERSION+"-"+[guid]::NewGuid().ToString()+".exe")
@@ -175,7 +176,8 @@ function Install-Python-EXE {
 
 function Install-Python-Embeddable {
   Ensure-Dir $EMB_DIR
-  $zip = Join-Path $env:TEMP ("python-embed-"+$PY_VERSION+"-"+[guid]::NewGuid().ToString()+".zip")
+  $zip   = Join-Path $env:TEMP ("python-embed-"+$PY_VERSION+"-"+[guid]::NewGuid().ToString()+".zip")
+  $pipLog= Join-Path $env:TEMP ("getpip-"+(Get-Date -Format "yyyyMMdd-HHmmss")+".log")
   Write-Host "Downloading Python $PY_VERSION (embeddable ZIP)..."
   Invoke-WebRequest -UseBasicParsing -Uri $PY_ZIP_URL -OutFile $zip
   Write-Host "Unpacking embeddable..."
@@ -183,7 +185,7 @@ function Install-Python-Embeddable {
   [System.IO.Compression.ZipFile]::ExtractToDirectory($zip, $EMB_DIR)
   try { Remove-Item $zip -Force } catch {}
 
-  # Enable site in the embeddable distro (uncomment 'import site' in python313._pth)
+  # Enable site
   $pth = Get-ChildItem -Path $EMB_DIR -Filter "python*.pth" -File | Select-Object -First 1
   if ($pth) {
     $content = Get-Content $pth
@@ -191,16 +193,34 @@ function Install-Python-Embeddable {
     Set-Content -Path $pth -Value $content -Encoding ASCII
   }
 
-  # Bootstrap pip
+  # Bootstrap pip quietly
   Write-Host "Bootstrapping pip inside embeddable..."
   $getpip = Join-Path $env:TEMP ("get-pip-"+[guid]::NewGuid().ToString()+".py")
   Invoke-WebRequest -UseBasicParsing -Uri $GET_PIP_URL -OutFile $getpip
   $pyexe = Join-Path $EMB_DIR "python.exe"
-  & $pyexe $getpip
+
+  # run get-pip with output redirected to log (avoid console output)
+  Start-Process -FilePath $pyexe -ArgumentList "`"$getpip`" --no-warn-script-location" `
+    -RedirectStandardOutput $pipLog -RedirectStandardError $pipLog -NoNewWindow -Wait
   try { Remove-Item $getpip -Force } catch {}
 
-  # Upgrade pip/wheel
-  & $pyexe -m pip install -U pip wheel | Out-Null
+  # Verify pip actually installed
+  $pipOk = $false
+  try {
+    $ver = & $pyexe -m pip --version 2>$null
+    if ($LASTEXITCODE -eq 0 -and $ver) { $pipOk = $true }
+  } catch { $pipOk = $false }
+
+  if (-not $pipOk) {
+    Write-Host "get-pip output (tail): $pipLog" -ForegroundColor Yellow
+    try { Get-Content -Path $pipLog -Tail 80 | ForEach-Object { Write-Host "  $_" } } catch {}
+    throw "pip did not install correctly in embeddable runtime."
+  }
+
+  # Quietly ensure wheel
+  Start-Process -FilePath $pyexe -ArgumentList "-m pip install -U pip wheel --no-warn-script-location" `
+    -RedirectStandardOutput $pipLog -RedirectStandardError $pipLog -NoNewWindow -Wait
+
   return $pyexe
 }
 
@@ -225,7 +245,6 @@ Write-Host "[2/12] Installing Git + curl (Chocolatey)..."
 Ensure-GitCurl
 
 Write-Host "[3/12] Installing Python..."
-# First try EXE (may be blocked by policy)
 $exeRes = Install-Python-EXE
 $PYEXE = $null
 if ($exeRes.Path) {
@@ -263,7 +282,7 @@ $SAFETY   = [int](Read-Default "Safety margin seconds (subtract from each window
 
 $SRC_DIR  = Join-Path $PREFIX "src"
 $VENV_DIR = Join-Path $PREFIX ".venv"
-$EMB_DIR  = Join-Path $PREFIX "pyembed"  # ensure path under chosen prefix for wrappers
+$EMB_DIR  = Join-Path $PREFIX "pyembed"
 $WRAPPER_PS = Join-Path $BIN_DIR "mtr-logger.ps1"
 $WRAPPER_CMD= Join-Path $BIN_DIR "mtr-logger.cmd"
 $UNINSTALL_PS = Join-Path $BIN_DIR "uninstall.ps1"
@@ -298,23 +317,20 @@ if (-not (Test-Path (Join-Path $SRC_DIR "pyproject.toml"))) {
   Write-Host "pyproject.toml not found in $SRC_DIR" -ForegroundColor Red; exit 1
 }
 
-# If we have a full Python (EXE), use venv; if embeddable, just use that interpreter directly
-$UsingEmbeddable = $false
-if ($PYEXE -and ($PYEXE -like "*\pyembed\*")) { $UsingEmbeddable = $true }
+# If we have full Python (EXE), use venv; if embeddable, use interpreter directly
+$UsingEmbeddable = ($PYEXE -like "*\pyembed\*")
 
 if (-not $UsingEmbeddable) {
   Write-Host "[7/12] Creating virtualenv: $VENV_DIR"
   Ensure-Dir $VENV_DIR
   & $PYEXE -m venv $VENV_DIR
   $RUN_PY  = Join-Path $VENV_DIR "Scripts\python.exe"
-  $RUN_PIP = Join-Path $VENV_DIR "Scripts\pip.exe"
   Write-Host "[8/12] Installing package (editable) into venv..."
-  & $RUN_PIP install -U pip wheel | Out-Null
-  & $RUN_PIP install -e $SRC_DIR | Out-Null
+  & $RUN_PY -m pip install -U pip wheel | Out-Null
+  & $RUN_PY -m pip install -e $SRC_DIR | Out-Null
 } else {
   Write-Host "[7/12] Using embeddable Python at $PYEXE (no venv)"
   $RUN_PY  = $PYEXE
-  $RUN_PIP = "$($PYEXE -replace 'python.exe$','Scripts\pip.exe')"
   Write-Host "[8/12] Installing package (editable) into embeddable runtime..."
   & $RUN_PY -m pip install -U pip wheel | Out-Null
   & $RUN_PY -m pip install -e $SRC_DIR | Out-Null
