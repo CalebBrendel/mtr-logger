@@ -590,3 +590,18 @@ Write-Host "Try interactive NOW (no new terminal needed):"
 Write-Host "  mtr-logger $TARGET --proto tcp"
 Write-Host "Uninstall anytime:  mtr-logger uninstall"
 Write-Host "Logs: $LOG_DIR"
+
+# --------------------------------------------------------------------
+$py = "C:\mtr-logger\.venv\Scripts\python.exe"
+if (!(Test-Path $py)) { $py = "C:\mtr-logger\pyembed\python.exe" }
+if (Test-Path $py) {
+    $site = & $py -c "import site,sys,os; p=(site.getsitepackages() or [os.path.join(sys.prefix,'Lib','site-packages')])[0]; print(p)"
+    $site = $site.Trim()
+    $pth = Join-Path $site "zzz_win_asyncio_policy.pth"
+    $mod = Join-Path $site "win_asyncio_policy.py"
+    foreach ($f in @($pth,$mod)) {
+        if (Test-Path $f) { Remove-Item -Force $f }
+    }
+    Write-Host "Cleaned asyncio override: using default Proactor loop (works with subprocesses)."
+}
+# --------------------------------------------------------------------
