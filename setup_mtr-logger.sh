@@ -1,6 +1,5 @@
 #!/usr/bin/env bash
 set -euo pipefail
-#set -x
 
 # ----------------- Logo -----------------
 print_logo() {
