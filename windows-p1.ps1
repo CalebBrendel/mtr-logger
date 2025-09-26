@@ -1,9 +1,10 @@
 <#  windows-onefile.ps1 — One-command Windows installer for mtr-logger (PowerShell 5.1)
-    v6:
-      - Robust embeddable Python bootstrapping:
-        * get-pip output fully redirected to a log (no console bleed that confuses IEX)
-        * verifies pip presence; shows log tail on failure
-      - Keeps EXE install attempt first; falls back on policy block (0x659)
+    v6.1:
+      - Embeddable Python path is idempotent:
+          * If pyembed\python.exe exists, reuse it (skip unzip)
+          * If pyembed exists but is partial, remove & re-extract
+      - Keeps EXE-first install; falls back on MSI policy block (0x659)
+      - get-pip output fully redirected to a log and verified
 #>
 
 $ErrorActionPreference = 'Stop'
@@ -137,7 +138,7 @@ function Ensure-Choco {
   if (-not (Get-Command choco.exe -ErrorAction SilentlyContinue)) {
     Write-Host "Installing Chocolatey..."
     Set-ExecutionPolicy Bypass -Scope Process -Force
-    [System.Net.ServicePointManager]::SecurityProtocol = [System.Net.SecurityType]::Tls12
+    [System.Net.ServicePointManager]::SecurityProtocol = [System.Net.SecurityProtocolType]::Tls12
     Invoke-Expression ((New-Object System.Net.WebClient).DownloadString('https://community.chocolatey.org/install.ps1'))
     $env:Path += ";$env:ALLUSERSPROFILE\chocolatey\bin"
   }
@@ -175,7 +176,19 @@ function Install-Python-EXE {
 }
 
 function Install-Python-Embeddable {
+  # Idempotent: reuse existing if present
+  $existing = Join-Path $EMB_DIR "python.exe"
+  if (Test-Path $existing) {
+    Write-Host "Embeddable Python already present at $existing — reusing."
+    return $existing
+  }
+
+  # Clean target if partially present
+  if (Test-Path $EMB_DIR) {
+    try { Remove-Item -Recurse -Force $EMB_DIR } catch {}
+  }
   Ensure-Dir $EMB_DIR
+
   $zip   = Join-Path $env:TEMP ("python-embed-"+$PY_VERSION+"-"+[guid]::NewGuid().ToString()+".zip")
   $pipLog= Join-Path $env:TEMP ("getpip-"+(Get-Date -Format "yyyyMMdd-HHmmss")+".log")
   Write-Host "Downloading Python $PY_VERSION (embeddable ZIP)..."
@@ -198,8 +211,6 @@ function Install-Python-Embeddable {
   $getpip = Join-Path $env:TEMP ("get-pip-"+[guid]::NewGuid().ToString()+".py")
   Invoke-WebRequest -UseBasicParsing -Uri $GET_PIP_URL -OutFile $getpip
   $pyexe = Join-Path $EMB_DIR "python.exe"
-
-  # run get-pip with output redirected to log (avoid console output)
   Start-Process -FilePath $pyexe -ArgumentList "`"$getpip`" --no-warn-script-location" `
     -RedirectStandardOutput $pipLog -RedirectStandardError $pipLog -NoNewWindow -Wait
   try { Remove-Item $getpip -Force } catch {}
