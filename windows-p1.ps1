@@ -1,19 +1,27 @@
-<#  bootstrap_mtr-logger.ps1
-    One-go Windows setup for mtr-logger (PowerShell 5.1 compatible)
+<#  windows-p1.ps1  — One-go bootstrap for mtr-logger (PowerShell 5.1 compatible)
     1) Ensure elevation & TLS 1.2
-    2) Install Python 3 (winget -> official EXE fallback)
+    2) Install Python 3 (winget -> official EXE fallback), refresh PATH
     3) Verify a real python.exe (not MS Store alias), check version
-    4) Download and run your main installer script
+    4) Download and run your main installer (second-stage script)
+
+    Usage (elevated PowerShell):
+      Set-ExecutionPolicy Bypass -Scope Process -Force
+      # from a URL:
+      irm https://raw.githubusercontent.com/CalebBrendel/mtr-logger/refs/heads/main/windows-p1.ps1 | iex
+      # or run locally:
+      .\windows-p1.ps1
+
+    You can override the second-stage URL via -InstallerUrl.
 #>
 
 param(
-  # Your main installer (PS 5.1–compatible) URL:
+  # Your main installer (PowerShell 5.1–compatible) URL:
   [string]$InstallerUrl = "https://calebbrendel.com/mtr-logger/windowsp2",
 
-  # Fallback Python EXE (adjust if you prefer another version)
+  # Fallback Python EXE (adjust version if you like):
   [string]$PythonExeUrl = "https://www.python.org/ftp/python/3.12.5/python-3.12.5-amd64.exe",
 
-  # Minimum acceptable Python version
+  # Minimum acceptable Python version:
   [version]$MinPy = [version]"3.8"
 )
 
@@ -28,30 +36,42 @@ function Require-Admin {
     exit 1
   }
 }
+
 function Ensure-TLS12 {
-  try { [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12 } catch {}
+  try {
+    [Net.ServicePointManager]::SecurityProtocol =
+      [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
+  } catch {}
 }
+
 function Refresh-Path {
-  $env:Path = [Environment]::GetEnvironmentVariable('Path','Machine') + ';' +
-              [Environment]::GetEnvironmentVariable('Path','User')
+  $machine = [Environment]::GetEnvironmentVariable('Path','Machine')
+  $user    = [Environment]::GetEnvironmentVariable('Path','User')
+  if ($machine) { $env:Path = $machine } else { $env:Path = "" }
+  if ($user)    { $env:Path = ($env:Path.TrimEnd(';') + ';' + $user) }
 }
 
 # Return a **real** python.exe path (avoid MS Store alias)
 function Resolve-PythonPath {
-  # Try py launcher enumeration first
+  # Try the 'py' launcher first
   try {
     $pyCmd = Get-Command py -ErrorAction Stop
     $list = & py -0p 2>$null
     if ($list) {
       foreach ($line in ($list -split "`n")) {
         $exe = $line.Trim()
-        if ($exe -and (Test-Path $exe) -and ($exe -like "*\python.exe")) { return $exe }
+        if ($exe -and (Test-Path $exe) -and ($exe -like "*\python.exe")) {
+          return $exe
+        }
       }
     }
     # Fallback: ask py -3 for the executable
     try {
       $p = & py -3 -c "import sys; print(sys.executable)" 2>$null
-      if ($p) { $p = $p.Trim(); if (Test-Path $p) { return $p } }
+      if ($p) {
+        $p = $p.Trim()
+        if (Test-Path $p) { return $p }
+      }
     } catch {}
   } catch {}
 
@@ -74,14 +94,18 @@ function Resolve-PythonPath {
     "$env:LOCALAPPDATA\Programs\Python\Python311\python.exe",
     "$env:LOCALAPPDATA\Programs\Python\Python310\python.exe"
   )
-  foreach ($c in $candidates) { if (Test-Path $c) { return $c } }
+  foreach ($c in $candidates) {
+    if ($c -and (Test-Path $c)) { return $c }
+  }
 
   return $null
 }
 
 function Install-Python {
+  # If already resolvable, we’re good
   if (Resolve-PythonPath) { return }
 
+  # winget path
   $haveWinget = $false
   try { Get-Command winget -ErrorAction Stop | Out-Null; $haveWinget = $true } catch {}
 
@@ -111,19 +135,27 @@ function Install-Python {
 }
 
 function Check-Python-Version {
-  param([string]$PyPath)
+  param([string]$PyPath, [version]$MinVersion)
   $v = & $PyPath -c "import sys; print('.'.join(map(str, sys.version_info[:3])))"
   $v = ($v | Select-Object -First 1).Trim()
-  if (-not ($v -match '^\d+\.\d+(\.\d+)?$')) { throw "Could not parse Python version string: '$v'" }
-  if ([version]$v -lt $MinPy) { throw "Python $v is below the required minimum of $MinPy." }
+  if (-not ($v -match '^\d+\.\d+(\.\d+)?$')) {
+    throw "Could not parse Python version string: '$v'"
+  }
+  if ([version]$v -lt $MinVersion) {
+    throw "Python $v is below the required minimum of $MinVersion."
+  }
   return $true
 }
 
 function Run-Installer {
   param([string]$Url)
   Write-Host "Downloading and running installer from: $Url"
-  $script = Invoke-WebRequest -UseBasicParsing -Uri $Url | Select-Object -ExpandProperty Content
-  if ([string]::IsNullOrWhiteSpace($script)) { throw "Failed to download installer script from $Url" }
+  $resp = Invoke-WebRequest -UseBasicParsing -Uri $Url
+  $script = $null
+  if ($resp -and $resp.Content) { $script = $resp.Content }
+  if ([string]::IsNullOrWhiteSpace($script)) {
+    throw "Failed to download installer script from $Url"
+  }
   Invoke-Expression $script
 }
 
@@ -136,9 +168,11 @@ Write-Host "[1/3] Ensuring Python is installed..."
 Install-Python
 
 $PythonExe = Resolve-PythonPath
-if (-not $PythonExe) { throw "Python still not resolvable after installation. Open a new elevated PowerShell and rerun this script." }
+if (-not $PythonExe) {
+  throw "Python still not resolvable after installation. Open a new elevated PowerShell and rerun this script."
+}
 
-Check-Python-Version -PyPath $PythonExe | Out-Null
+Check-Python-Version -PyPath $PythonExe -MinVersion $MinPy | Out-Null
 Write-Host ("    - Using Python: {0}" -f $PythonExe)
 
 Write-Host "[2/3] Refreshing PATH for this session..."
