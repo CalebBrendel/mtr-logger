@@ -161,7 +161,7 @@ choose_timezone_with_menu(){
   echo
   echo "[TZ] Detected host timezone: $detected"
   local yn
-  yn="$(ask_yn 'Is this the correct timezone?' 'Y')"
+  yn="$(ask_yn 'Is this the correct timezone?' 'Y/n')"
   if [[ "$yn" == "Y" ]]; then
     echo "    - Keeping system timezone as: $detected"
     CRON_TZ_VAL="$detected"
