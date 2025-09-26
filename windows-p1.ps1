@@ -1,9 +1,9 @@
 <#  windows-onefile.ps1 — One-command Windows installer for mtr-logger (PowerShell 5.1+)
-    v6.6:
-      - Adds traceroute shim (traceroute.ps1/.cmd -> tracert.exe)
-      - Robust embeddable pip bootstrap (always enable 'import site'; no Start-Process redirect clash)
-      - Refreshes PATH for the **current session** so `mtr-logger` works immediately
-      - EXE-first Python install; fallback to embeddable ZIP
+    v7.0:
+      - FIX: Scheduled Tasks quoting via cmd.exe /d /c wrapper
+      - FIX: traceroute shim now parses tracert.exe and prints Linux-like traceroute lines
+      - PATH refresh for current session so wrapper works immediately
+      - EXE-first Python install; fallback to embeddable ZIP + robust pip bootstrap
 #>
 
 $ErrorActionPreference = 'Stop'
@@ -250,12 +250,13 @@ function Task-Delete-IfExists([string]$Name) {
     cmd /c "schtasks /Delete /TN `"$Name`" /F >NUL 2>&1"
   }
 }
-function Task-Create([string]$Name, [string]$Cmd, [string]$Schedule, [string]$Mo = "", [string]$StartTime = "") {
-  $common = @("/TN", $Name, "/TR", $Cmd, "/RU", "SYSTEM", "/RL", "HIGHEST", "/F")
-  $args = @("/Create") + $common + @("/SC", $Schedule)
-  if ($Mo)       { $args += @("/MO", $Mo) }
-  if ($StartTime){ $args += @("/ST", $StartTime) }
-  Start-Process -FilePath schtasks.exe -ArgumentList $args -NoNewWindow -Wait
+function Task-Create([string]$Name, [string]$CmdLine, [string]$Schedule, [string]$Mo = "", [string]$StartTime = "") {
+  # Wrap with cmd.exe to support redirection and complex quoting in /TR
+  $Wrapped = "cmd.exe /d /c " + $CmdLine
+  $common = @("/Create","/TN",$Name,"/TR",$Wrapped,"/RU","SYSTEM","/RL","HIGHEST","/F","/SC",$Schedule)
+  if ($Mo)       { $common += @("/MO",$Mo) }
+  if ($StartTime){ $common += @("/ST",$StartTime) }
+  Start-Process -FilePath schtasks.exe -ArgumentList $common -NoNewWindow -Wait
 }
 
 # ----------------- Main flow -----------------
@@ -272,11 +273,17 @@ Write-Host @"
 == mtr-logger bootstrap (Windows, one-file) ==
 "@
 
-Write-Host "[1/12] Ensuring Chocolatey..."
-Ensure-Choco
+Write-Host "[1/12] Ensuring Chocolatey..."; if (-not (Get-Command choco.exe -ErrorAction SilentlyContinue)) {
+  Set-ExecutionPolicy Bypass -Scope Process -Force
+  [System.Net.ServicePointManager]::SecurityProtocol = [System.Net.SecurityProtocolType]::Tls12
+  Invoke-Expression ((New-Object System.Net.WebClient).DownloadString('https://community.chocolatey.org/install.ps1'))
+  $env:Path += ";$env:ALLUSERSPROFILE\chocolatey\bin"
+}
 
 Write-Host "[2/12] Installing Git + curl (Chocolatey)..."
-Ensure-GitCurl
+choco install -y --no-progress git | Out-Null
+choco install -y --no-progress curl | Out-Null
+Refresh-Path
 
 Write-Host "[3/12] Installing Python..."
 $exeRes = Install-Python-EXE
@@ -427,27 +434,26 @@ powershell -NoProfile -ExecutionPolicy Bypass -Command ^
   "& `"$WRAPPER_PS`" %*"
 "@ | Set-Content -Encoding OEM $WRAPPER_CMD
 
-# --- traceroute shim (so tools expecting `traceroute` work on Windows) ---
+# --- traceroute shim (parse tracert → print Linux-like traceroute) ---
 @'
 param([string[]]$Args)
 
+# Defaults
 $dest     = $null
 $numeric  = $false    # -n -> tracert -d
 $maxhops  = $null     # -m X -> tracert -h X
-$timeoutS = $null     # -w S (seconds) -> tracert -w ms
+$timeoutS = $null     # -w S -> tracert -w ms
 
+# Parse minimal options
 for ($i=0; $i -lt $Args.Count; $i++) {
   $a = $Args[$i]
   switch ($a) {
     '-n' { $numeric = $true }
     '-m' { if ($i + 1 -lt $Args.Count) { $maxhops = [int]$Args[++$i] } }
     '-w' { if ($i + 1 -lt $Args.Count) { $timeoutS = [double]$Args[++$i] } }
-    default {
-      if ($a -notmatch '^-') { $dest = $a }
-    }
+    default { if ($a -notmatch '^-') { $dest = $a } }
   }
 }
-
 if (-not $dest) { Write-Error "Usage: traceroute <host>"; exit 1 }
 
 $trArgs = @()
@@ -456,7 +462,51 @@ if ($maxhops)    { $trArgs += @('-h', [int]$maxhops) }
 if ($timeoutS)   { $trArgs += @('-w', ([int][Math]::Ceiling($timeoutS * 1000))) }
 $trArgs += $dest
 
-& "$env:SystemRoot\System32\tracert.exe" @trArgs
+# Run tracert
+$lines = & "$env:SystemRoot\System32\tracert.exe" @trArgs 2>&1
+
+# Print Linux-like header
+"traceroute to $dest, using Windows tracert"
+
+# Parse each hop line like:
+#   "  1    <1 ms   2 ms   3 ms  10.0.0.1"
+#   "  2     *       *      *    Request timed out."
+$hop = 0
+foreach ($ln in $lines) {
+  if ($ln -match '^\s*(\d+)\s+(.+)$') {
+    $hop = [int]$matches[1]
+    $rest = $matches[2]
+
+    # Get RTT tokens and endpoint/IP
+    $rtts = @()
+    $ip   = $null
+
+    # Replace "<1 ms" with "1 ms" for simplicity
+    $rest = $rest -replace '<\s*1\s*ms','1 ms'
+
+    # If timed out
+    if ($rest -match 'Request timed out') {
+      # print: "* * *"
+      "{0,2}  *  *  *" -f $hop
+      continue
+    }
+
+    # Extract up to three RTT values like "12 ms"
+    $rttMatches = [regex]::Matches($rest, '(\d+)\s*ms')
+    foreach ($m in $rttMatches) { $rtts += ([int]$m.Groups[1].Value) }
+
+    # Extract last IPv4 (best effort); if not found, show token
+    $ipMatch = [regex]::Matches($rest, '(\d{1,3}(\.\d{1,3}){3})')
+    if ($ipMatch.Count -gt 0) { $ip = $ipMatch[$ipMatch.Count-1].Groups[1].Value }
+
+    if (-not $ip) { $ip = "???" }
+    if ($rtts.Count -eq 0) { $rtts = @('*','*','*') }
+
+    # Print linux-ish: " 1  10.0.0.1  1.0 ms  2.0 ms  3.0 ms"
+    $rttText = ($rtts | ForEach-Object { if ($_ -is [int]) { "{0} ms" -f $_ } else { "*" } }) -join "  "
+    "{0,2}  {1}  {2}" -f $hop, $ip, $rttText
+  }
+}
 exit $LASTEXITCODE
 '@ | Set-Content -Encoding UTF8 (Join-Path $BIN_DIR "traceroute.ps1")
 
@@ -481,21 +531,20 @@ $archOut= Join-Path $env:USERPROFILE "mtr-logger-archive.log"
 Task-Delete-IfExists $MAIN_TASK
 Task-Delete-IfExists $ARCH_TASK
 
+# Build properly quoted /TR lines; note double quotes inside the outer quotes
 $stepMin = [int](60 / $LPH)
 $windowSec = $stepMin * 60
 $duration = $windowSec - $SAFETY
 
-$logCmd = "`"$WRAPPER_CMD`" `"$TARGET`" --proto `"$PROTO`" --dns `"$DNS_MODE`" -i `"$INTERVAL`" --timeout `"$TIMEOUT`" -p `"$PROBES`" --duration $duration --export --outfile auto >> `"$logOut`" 2>&1"
-Task-Create -Name $MAIN_TASK -Cmd $logCmd -Schedule "MINUTE" -Mo "$stepMin"
+$logInner = """$WRAPPER_CMD"" ""$TARGET"" --proto ""$PROTO"" --dns ""$DNS_MODE"" -i ""$INTERVAL"" --timeout ""$TIMEOUT"" -p ""$PROBES"" --duration $duration --export --outfile auto >> ""$logOut"" 2>&1"
+Task-Create -Name $MAIN_TASK -CmdLine $logInner -Schedule "MINUTE" -Mo "$stepMin"
 
-$archCmd = "`"$RUN_PY`" -m mtrpy.archiver --retention $ARCHIVE_RETENTION_DEFAULT >> `"$archOut`" 2>&1"
-Task-Create -Name $ARCH_TASK -Cmd $archCmd -Schedule "DAILY" -StartTime "00:00"
+$archInner = """$RUN_PY"" -m mtrpy.archiver --retention $ARCHIVE_RETENTION_DEFAULT >> ""$archOut"" 2>&1"
+Task-Create -Name $ARCH_TASK -CmdLine $archInner -Schedule "DAILY" -StartTime "00:00"
 
 # ----------------- Self-test + PATH refresh (CURRENT SESSION) -----------------
 Write-Host "[12/12] PATH refresh and self-test..."
-# Refresh PATH for **this** session so wrapper & traceroute are usable immediately:
 Refresh-Path
-# Prepend BIN_DIR to this session's PATH (ensures our shims win):
 if (($env:Path -split ';') -notcontains $BIN_DIR) { $env:Path = "$BIN_DIR;$env:Path" }
 
 try {
