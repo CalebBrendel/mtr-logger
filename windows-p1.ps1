@@ -1,27 +1,28 @@
-<#  windows-onefile.ps1 — One-command Windows installer for mtr-logger (PowerShell 5.1)
-    v6.4:
-      - Robust Ensure-Embeddable-Pip: always enable 'import site', run get-pip directly, verify, show tail on fail
-      - Uses EXE installer first; falls back to embeddable ZIP
-      - Safe Scheduled Tasks; idempotent reruns
+<#  windows-onefile.ps1 — One-command Windows installer for mtr-logger (PowerShell 5.1+)
+    v6.6:
+      - Adds traceroute shim (traceroute.ps1/.cmd -> tracert.exe)
+      - Robust embeddable pip bootstrap (always enable 'import site'; no Start-Process redirect clash)
+      - Refreshes PATH for the **current session** so `mtr-logger` works immediately
+      - EXE-first Python install; fallback to embeddable ZIP
 #>
 
 $ErrorActionPreference = 'Stop'
 
-# ----------------- Config / Defaults -----------------
+# ----------------- Defaults -----------------
 $GIT_URL_DEFAULT      = "https://github.com/CalebBrendel/mtr-logger.git"
 $BRANCH_DEFAULT       = "main"
 $PREFIX_DEFAULT       = "C:\mtr-logger"
 $BIN_DIR_DEFAULT      = "C:\mtr-logger\bin"
 
 $TARGET_DEFAULT       = "google.ca"
-$PROTO_DEFAULT        = "icmp"
+$PROTO_DEFAULT        = "icmp"     # icmp|tcp|udp
 $DNS_DEFAULT          = "auto"
 $INTERVAL_DEFAULT     = "0.3"
 $TIMEOUT_DEFAULT      = "0.3"
 $PROBES_DEFAULT       = "3"
 $ASCII_DEFAULT        = "yes"
 
-$LOGS_PER_HOUR_DEFAULT= 4
+$LOGS_PER_HOUR_DEFAULT= 4          # must divide 60
 $SAFETY_MARGIN_DEFAULT= 5
 $ARCHIVE_RETENTION_DEFAULT = 90
 
@@ -31,7 +32,7 @@ $PY_EXE_URL  = "https://www.python.org/ftp/python/$PY_VERSION/python-$PY_VERSION
 $PY_ZIP_URL  = "https://www.python.org/ftp/python/$PY_VERSION/python-$PY_VERSION-embed-amd64.zip"
 $GET_PIP_URL = "https://bootstrap.pypa.io/get-pip.py"
 
-# Derived (recomputed after prompts)
+# Derived (updated after prompts)
 $SRC_DIR   = Join-Path $PREFIX_DEFAULT "src"
 $VENV_DIR  = Join-Path $PREFIX_DEFAULT ".venv"
 $EMB_DIR   = Join-Path $PREFIX_DEFAULT "pyembed"
@@ -154,7 +155,6 @@ function Install-Python-EXE {
   Write-Host "Downloading Python $PY_VERSION (EXE) ..."
   Invoke-WebRequest -UseBasicParsing -Uri $PY_EXE_URL -OutFile $tmp
 
-  # All-Users
   Write-Host "Installing Python (All-Users, silent)..."
   $argsAU = "/quiet InstallAllUsers=1 PrependPath=1 Include_test=0 Include_launcher=1 InstallLauncherAllUsers=1 /log `"$log`""
   Start-Process $tmp -ArgumentList $argsAU -Wait
@@ -162,7 +162,6 @@ function Install-Python-EXE {
   $py = Resolve-Python
   if ($py) { try { Remove-Item $tmp -Force } catch {}; return @{ Path=$py; Log=$log } }
 
-  # Per-User
   Write-Host "All-Users install not visible; retrying Per-User install..."
   $argsPU = "/quiet InstallAllUsers=0 PrependPath=1 Include_test=0 Include_launcher=1 /log `"$log`""
   Start-Process $tmp -ArgumentList $argsPU -Wait
@@ -173,18 +172,15 @@ function Install-Python-EXE {
 }
 
 function Install-Python-Embeddable {
-  # Idempotent reuse if present
   $existing = Join-Path $EMB_DIR "python.exe"
   if (Test-Path $existing) {
     Write-Host "Embeddable Python already present at $existing — reusing."
     return $existing
   }
-  # Clean target if partially present
   if (Test-Path $EMB_DIR) { try { Remove-Item -Recurse -Force $EMB_DIR } catch {} }
   Ensure-Dir $EMB_DIR
 
   $zip   = Join-Path $env:TEMP ("python-embed-"+$PY_VERSION+"-"+[guid]::NewGuid().ToString()+".zip")
-  $pipLog= Join-Path $env:TEMP ("getpip-"+(Get-Date -Format "yyyyMMdd-HHmmss")+".log")
   Write-Host "Downloading Python $PY_VERSION (embeddable ZIP)..."
   Invoke-WebRequest -UseBasicParsing -Uri $PY_ZIP_URL -OutFile $zip
   Write-Host "Unpacking embeddable..."
@@ -220,14 +216,12 @@ function Install-Python-Embeddable {
 
 function Ensure-Embeddable-Pip([string]$PyExe) {
   $root = Split-Path -Parent $PyExe
-  # 1) Always ensure 'import site' is enabled
   $pth = Get-ChildItem -Path $root -Filter "python*.pth" -File | Select-Object -First 1
   if ($pth) {
     $content = Get-Content $pth
     $new = $content -replace '^\s*#\s*import site\s*$', 'import site'
     if ($new -ne $content) { Set-Content -Path $pth -Value $new -Encoding ASCII }
   }
-  # 2) If pip missing, run get-pip once (no redirects)
   try {
     & $PyExe -m pip --version 2>$null | Out-Null
     if ($LASTEXITCODE -eq 0) { return }
@@ -236,7 +230,6 @@ function Ensure-Embeddable-Pip([string]$PyExe) {
   $getpip = Join-Path $env:TEMP ("get-pip-"+[guid]::NewGuid().ToString()+".py")
   $pipLog = Join-Path $env:TEMP ("getpip-repair-"+(Get-Date -Format "yyyyMMdd-HHmmss")+".log")
   Invoke-WebRequest -UseBasicParsing -Uri $GET_PIP_URL -OutFile $getpip
-  # capture both streams to a log via *> for troubleshooting
   & $PyExe $getpip --no-warn-script-location *> $pipLog
   try { Remove-Item $getpip -Force } catch {}
   & $PyExe -m pip --version 2>$null | Out-Null
@@ -269,15 +262,15 @@ function Task-Create([string]$Name, [string]$Cmd, [string]$Schedule, [string]$Mo
 Require-Admin
 Ensure-TLS12
 
-Write-Host ""
-Write-Host "         __           .__                                     "
-Write-Host "  ______/  |________  |  |   ____   ____   ____   ___________ "
-Write-Host " /     \   __\_  __ \ |  |  /  _ \ / ___\ / ___\_/ __ \_  __ \"
-Write-Host "|  Y Y  \  |  |  | \/ |  |_(  <_> ) /_/  > /_/  >  ___/|  | \/"
-Write-Host "|__|_|  /__|  |__|    |____/\____/\___  /\___  / \___  >__|   "
-Write-Host "      \/                         /_____//_____/      \/        "
-Write-Host "== mtr-logger bootstrap (Windows, one-file) =="
-Write-Host ""
+Write-Host @"
+         __           .__
+  ______/  |________  |  |   ____   ____   ____   ___________
+ /     \   __\_  __ \ |  |  /  _ \ / ___\ / ___\_/ __ \_  __ \
+|  Y Y  \  |  |  | \/ |  |_(  <_> ) /_/  > /_/  >  ___/|  | \/
+|__|_|  /__|  |__|    |____/\____/\___  /\___  / \___  >__|
+      \/                         /_____//_____/      \/
+== mtr-logger bootstrap (Windows, one-file) ==
+"@
 
 Write-Host "[1/12] Ensuring Chocolatey..."
 Ensure-Choco
@@ -377,9 +370,10 @@ if ($UsingEmbeddable) {
   & $RUN_PY -m pip install -e $SRC_DIR | Out-Null
 }
 
-Write-Host "[9/12] Creating wrapper + uninstall in $BIN_DIR"
+Write-Host "[9/12] Creating wrapper, traceroute shim, and uninstall in $BIN_DIR"
 Ensure-Dir $BIN_DIR
 
+# Uninstall
 @"
 param()
 Write-Host "This will uninstall mtr-logger:" -ForegroundColor Yellow
@@ -399,6 +393,8 @@ if (Test-Path "$PREFIX") { Remove-Item -Recurse -Force "$PREFIX" }
 Write-Host "[3/5] Removing wrappers..."
 if (Test-Path "$WRAPPER_CMD") { Remove-Item -Force "$WRAPPER_CMD" }
 if (Test-Path "$WRAPPER_PS")  { Remove-Item -Force "$WRAPPER_PS" }
+if (Test-Path (Join-Path "$BIN_DIR" "traceroute.cmd")) { Remove-Item -Force (Join-Path "$BIN_DIR" "traceroute.cmd") }
+if (Test-Path (Join-Path "$BIN_DIR" "traceroute.ps1")) { Remove-Item -Force (Join-Path "$BIN_DIR" "traceroute.ps1") }
 
 Write-Host "[4/5] (Optional) Remove logs at `$env:USERPROFILE\mtr\logs"
 `$del = Read-Host "Delete logs as well? [y/N]"
@@ -410,6 +406,7 @@ if (`$del -and `$del.ToLower() -in @('y','yes')) {
 Write-Host "[5/5] Uninstall complete."
 "@ | Set-Content -Encoding UTF8 $UNINSTALL_PS
 
+# Wrapper (PS)
 @"
 param([Parameter(ValueFromRemainingArguments=`$true)]`$Args)
 if (`$Args.Count -gt 0 -and `$Args[0].ToString().ToLower() -eq 'uninstall') {
@@ -419,6 +416,7 @@ if (`$Args.Count -gt 0 -and `$Args[0].ToString().ToLower() -eq 'uninstall') {
 & "$RUN_PY" -m mtrpy @Args
 "@ | Set-Content -Encoding UTF8 $WRAPPER_PS
 
+# Wrapper (CMD shim)
 @"
 @echo off
 if /I "%~1"=="uninstall" (
@@ -429,11 +427,49 @@ powershell -NoProfile -ExecutionPolicy Bypass -Command ^
   "& `"$WRAPPER_PS`" %*"
 "@ | Set-Content -Encoding OEM $WRAPPER_CMD
 
+# --- traceroute shim (so tools expecting `traceroute` work on Windows) ---
+@'
+param([string[]]$Args)
+
+$dest     = $null
+$numeric  = $false    # -n -> tracert -d
+$maxhops  = $null     # -m X -> tracert -h X
+$timeoutS = $null     # -w S (seconds) -> tracert -w ms
+
+for ($i=0; $i -lt $Args.Count; $i++) {
+  $a = $Args[$i]
+  switch ($a) {
+    '-n' { $numeric = $true }
+    '-m' { if ($i + 1 -lt $Args.Count) { $maxhops = [int]$Args[++$i] } }
+    '-w' { if ($i + 1 -lt $Args.Count) { $timeoutS = [double]$Args[++$i] } }
+    default {
+      if ($a -notmatch '^-') { $dest = $a }
+    }
+  }
+}
+
+if (-not $dest) { Write-Error "Usage: traceroute <host>"; exit 1 }
+
+$trArgs = @()
+if ($numeric)    { $trArgs += '-d' }
+if ($maxhops)    { $trArgs += @('-h', [int]$maxhops) }
+if ($timeoutS)   { $trArgs += @('-w', ([int][Math]::Ceiling($timeoutS * 1000))) }
+$trArgs += $dest
+
+& "$env:SystemRoot\System32\tracert.exe" @trArgs
+exit $LASTEXITCODE
+'@ | Set-Content -Encoding UTF8 (Join-Path $BIN_DIR "traceroute.ps1")
+
+@'
+@echo off
+powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0traceroute.ps1" %*
+'@ | Set-Content -Encoding ASCII (Join-Path $BIN_DIR "traceroute.cmd")
+
 Write-Host "[10/12] Ensuring $BIN_DIR on system PATH..."
 $curPath = [Environment]::GetEnvironmentVariable("Path","Machine")
 if (-not ($curPath -split ';' | Where-Object { $_ -ieq $BIN_DIR })) {
   [Environment]::SetEnvironmentVariable("Path", ($curPath.TrimEnd(';') + ";" + $BIN_DIR), "Machine")
-  Write-Host "    - Added to system PATH. Open a new terminal for it to take effect globally." -ForegroundColor Yellow
+  Write-Host "    - Added to system PATH (Machine)."
 }
 
 # ----------------- Scheduled Tasks -----------------
@@ -442,9 +478,12 @@ Ensure-Dir $LOG_DIR
 $logOut = Join-Path $env:USERPROFILE "mtr-logger.log"
 $archOut= Join-Path $env:USERPROFILE "mtr-logger-archive.log"
 
-# Delete if exist (quiet), then create
 Task-Delete-IfExists $MAIN_TASK
 Task-Delete-IfExists $ARCH_TASK
+
+$stepMin = [int](60 / $LPH)
+$windowSec = $stepMin * 60
+$duration = $windowSec - $SAFETY
 
 $logCmd = "`"$WRAPPER_CMD`" `"$TARGET`" --proto `"$PROTO`" --dns `"$DNS_MODE`" -i `"$INTERVAL`" --timeout `"$TIMEOUT`" -p `"$PROBES`" --duration $duration --export --outfile auto >> `"$logOut`" 2>&1"
 Task-Create -Name $MAIN_TASK -Cmd $logCmd -Schedule "MINUTE" -Mo "$stepMin"
@@ -452,7 +491,13 @@ Task-Create -Name $MAIN_TASK -Cmd $logCmd -Schedule "MINUTE" -Mo "$stepMin"
 $archCmd = "`"$RUN_PY`" -m mtrpy.archiver --retention $ARCHIVE_RETENTION_DEFAULT >> `"$archOut`" 2>&1"
 Task-Create -Name $ARCH_TASK -Cmd $archCmd -Schedule "DAILY" -StartTime "00:00"
 
-Write-Host "[12/12] Self-test..."
+# ----------------- Self-test + PATH refresh (CURRENT SESSION) -----------------
+Write-Host "[12/12] PATH refresh and self-test..."
+# Refresh PATH for **this** session so wrapper & traceroute are usable immediately:
+Refresh-Path
+# Prepend BIN_DIR to this session's PATH (ensures our shims win):
+if (($env:Path -split ';') -notcontains $BIN_DIR) { $env:Path = "$BIN_DIR;$env:Path" }
+
 try {
   & "$WRAPPER_PS" $TARGET --proto $PROTO --dns $DNS_MODE -i $INTERVAL --timeout $TIMEOUT -p $PROBES --duration 5 --export --outfile auto | Out-Null
   Write-Host "    - Self-test invoked."
@@ -462,7 +507,7 @@ try {
 
 Write-Host ""
 Write-Host "✅ Install complete."
-Write-Host "Run interactively (new terminal recommended so PATH reloads):"
+Write-Host "You can run NOW (no new terminal needed):"
 Write-Host "  mtr-logger $TARGET --proto $PROTO -i $INTERVAL --timeout $TIMEOUT -p $PROBES"
 Write-Host "Uninstall anytime:  mtr-logger uninstall"
 Write-Host "Logs: $LOG_DIR"
