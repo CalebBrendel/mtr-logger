@@ -1,8 +1,9 @@
 <#  windows-onefile.ps1 — One-command Windows installer for mtr-logger (PowerShell 5.1)
-    v6.2:
-      - If embeddable Python is reused and pip is missing, auto-bootstrap pip (get-pip) and verify
-      - Scheduled Tasks: safe query-before-delete; ignore missing tasks cleanly
-      - EXE-first Python install, fallback to embeddable ZIP; idempotent reruns
+    v6.3:
+      - FIX: pip bootstrap uses call operator with PS redirection (no Start-Process log clash)
+      - Idempotent embeddable reuse; pip repair if missing
+      - Safe Scheduled Tasks (ignore missing on delete)
+      - EXE-first Python install; fallback to embeddable ZIP
 #>
 
 $ErrorActionPreference = 'Stop'
@@ -200,13 +201,12 @@ function Install-Python-Embeddable {
     Set-Content -Path $pth -Value $content -Encoding ASCII
   }
 
-  # Bootstrap pip quietly
+  # Bootstrap pip (call operator + PS redirection to combine streams)
   Write-Host "Bootstrapping pip inside embeddable..."
   $getpip = Join-Path $env:TEMP ("get-pip-"+[guid]::NewGuid().ToString()+".py")
   Invoke-WebRequest -UseBasicParsing -Uri $GET_PIP_URL -OutFile $getpip
   $pyexe = Join-Path $EMB_DIR "python.exe"
-  Start-Process -FilePath $pyexe -ArgumentList "`"$getpip`" --no-warn-script-location" `
-    -RedirectStandardOutput $pipLog -RedirectStandardError $pipLog -NoNewWindow -Wait
+  & $pyexe $getpip --no-warn-script-location *> $pipLog
   try { Remove-Item $getpip -Force } catch {}
 
   # Verify pip actually installed
@@ -222,14 +222,12 @@ function Install-Python-Embeddable {
   }
 
   # Quietly ensure wheel
-  Start-Process -FilePath $pyexe -ArgumentList "-m pip install -U pip wheel --no-warn-script-location" `
-    -RedirectStandardOutput $pipLog -RedirectStandardError $pipLog -NoNewWindow -Wait
+  & $pyexe -m pip install -U pip wheel --no-warn-script-location *> $pipLog
 
   return $pyexe
 }
 
 function Ensure-Embeddable-Pip([string]$PyExe) {
-  # Re-bootstrap pip if missing in reused embeddable
   try {
     & $PyExe -m pip --version 2>$null | Out-Null
     if ($LASTEXITCODE -eq 0) { return }
@@ -238,10 +236,8 @@ function Ensure-Embeddable-Pip([string]$PyExe) {
   $pipLog= Join-Path $env:TEMP ("getpip-repair-"+(Get-Date -Format "yyyyMMdd-HHmmss")+".log")
   $getpip = Join-Path $env:TEMP ("get-pip-"+[guid]::NewGuid().ToString()+".py")
   Invoke-WebRequest -UseBasicParsing -Uri $GET_PIP_URL -OutFile $getpip
-  Start-Process -FilePath $PyExe -ArgumentList "`"$getpip`" --no-warn-script-location" `
-    -RedirectStandardOutput $pipLog -RedirectStandardError $pipLog -NoNewWindow -Wait
+  & $PyExe $getpip --no-warn-script-location *> $pipLog
   try { Remove-Item $getpip -Force } catch {}
-  # verify
   & $PyExe -m pip --version 2>$null | Out-Null
   if ($LASTEXITCODE -ne 0) {
     Write-Host "get-pip repair log (tail):" -ForegroundColor Yellow
@@ -261,7 +257,6 @@ function Task-Delete-IfExists([string]$Name) {
   }
 }
 function Task-Create([string]$Name, [string]$Cmd, [string]$Schedule, [string]$Mo = "", [string]$StartTime = "") {
-  # $Schedule: MINUTE|DAILY, optional $Mo (e.g. "5"), optional $StartTime ("HH:MM")
   $common = @("/TN", $Name, "/TR", $Cmd, "/RU", "SYSTEM", "/RL", "HIGHEST", "/F")
   $args = @("/Create") + $common + @("/SC", $Schedule)
   if ($Mo)       { $args += @("/MO", $Mo) }
