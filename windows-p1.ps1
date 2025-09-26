@@ -1,10 +1,8 @@
 <#  windows-onefile.ps1 — One-command Windows installer for mtr-logger (PowerShell 5.1)
-    v4:
-      - Python EXE: All-Users then Per-User
-      - Removes MS Store stubs
-      - Resolves python.exe via: py launcher, registry, known paths,
-        quick scans (incl. C:\Users\*\...\Python313), and
-        finally by parsing the Python installer log for TargetDir
+    v5:
+      - If Python EXE install fails or is blocked (MSI 1625 / 0x659), fallback to the
+        official **embeddable Python ZIP** (no MSI, no policy), enable site, bootstrap pip,
+        and continue using that interpreter.
 #>
 
 $ErrorActionPreference = 'Stop'
@@ -27,13 +25,16 @@ $LOGS_PER_HOUR_DEFAULT= 4
 $SAFETY_MARGIN_DEFAULT= 5
 $ARCHIVE_RETENTION_DEFAULT = 90
 
-# Python EXE
+# Python downloads (adjust version in one place)
 $PY_VERSION = "3.13.3"
-$PY_EXE_URL = "https://www.python.org/ftp/python/$PY_VERSION/python-$PY_VERSION-amd64.exe"
+$PY_EXE_URL  = "https://www.python.org/ftp/python/$PY_VERSION/python-$PY_VERSION-amd64.exe"
+$PY_ZIP_URL  = "https://www.python.org/ftp/python/$PY_VERSION/python-$PY_VERSION-embed-amd64.zip"
+$GET_PIP_URL = "https://bootstrap.pypa.io/get-pip.py"
 
 # Derived (recomputed after prompts)
 $SRC_DIR   = Join-Path $PREFIX_DEFAULT "src"
-$VENV_DIR  = Join-Path $PREFIX_DEFAULT ".venv"
+$VENV_DIR  = Join-Path $PREFIX_DEFAULT ".venv"   # used if full Python is installed
+$EMB_DIR   = Join-Path $PREFIX_DEFAULT "pyembed" # used for embed fallback
 $WRAPPER_PS= Join-Path $BIN_DIR_DEFAULT "mtr-logger.ps1"
 $WRAPPER_CMD=Join-Path $BIN_DIR_DEFAULT "mtr-logger.cmd"
 $UNINSTALL_PS = Join-Path $BIN_DIR_DEFAULT "uninstall.ps1"
@@ -96,25 +97,20 @@ function Resolve-Python-FromRegistry {
   }
   $cands | Sort-Object -Descending -Unique | Select-Object -First 1
 }
-
 function Resolve-Python {
-  # 1) py launcher
   try {
     Get-Command py -ErrorAction Stop | Out-Null
     $p = & py -3 -c "import sys,os;print(sys.executable if os.path.exists(sys.executable) else '')" 2>$null
     if ($p) { $p=$p.Trim(); if (Test-Path $p) { return $p } }
   } catch {}
-  # 2) Registry
   $reg = Resolve-Python-FromRegistry
   if($reg){ return $reg }
-  # 3) Known locations
   $cands=@(
     "C:\Program Files\Python313\python.exe","C:\Program Files\Python312\python.exe","C:\Program Files\Python311\python.exe","C:\Program Files\Python310\python.exe",
     "C:\Python313\python.exe","C:\Python312\python.exe","C:\Python311\python.exe","C:\Python310\python.exe",
     "$env:LOCALAPPDATA\Programs\Python\Python313\python.exe","$env:LOCALAPPDATA\Programs\Python\Python312\python.exe","$env:LOCALAPPDATA\Programs\Python\Python311\python.exe","$env:LOCALAPPDATA\Programs\Python\Python310\python.exe"
   )
   foreach ($c in $cands) { if (Test-Path $c) { return $c } }
-  # 4) Quick scans (bounded)
   foreach($root in @("C:\Program Files","C:\Program Files (x86)")){
     try {
       if(Test-Path $root){
@@ -123,17 +119,6 @@ function Resolve-Python {
       }
     } catch {}
   }
-  $usersRoot = "C:\Users"
-  try {
-    if(Test-Path $usersRoot){
-      $hit = Get-ChildItem -Path $usersRoot -Directory -ErrorAction SilentlyContinue |
-        ForEach-Object { Join-Path $_.FullName "AppData\Local\Programs\Python\Python313\python.exe" } |
-        Where-Object { Test-Path $_ } |
-        Select-Object -First 1
-      if($hit){ return $hit }
-    }
-  } catch {}
-  # 5) PATH (real file only)
   try { $pc=Get-Command python -ErrorAction Stop; if($pc.Source -and (Test-Path $pc.Source)){ return $pc.Source } } catch {}
   return $null
 }
@@ -162,54 +147,61 @@ function Ensure-GitCurl {
   Refresh-Path
 }
 
-# --- Install Python via EXE with logging and fallback ---
-function Ensure-PythonDirect {
-  Remove-StorePythonStubs
-  Refresh-Path
-
-  $existing = Resolve-Python
-  if ($existing) { return $existing }
-
+# --- Install Python via EXE with logging; fallback to embeddable ZIP if needed ---
+function Install-Python-EXE {
+  Remove-StorePythonStubs; Refresh-Path
   $tmp = Join-Path $env:TEMP ("python-"+$PY_VERSION+"-"+[guid]::NewGuid().ToString()+".exe")
   $log = Join-Path $env:TEMP ("PythonInstall-"+(Get-Date -Format "yyyyMMdd-HHmmss")+".log")
-  Write-Host "Downloading Python $PY_VERSION ..."
+  Write-Host "Downloading Python $PY_VERSION (EXE) ..."
   Invoke-WebRequest -UseBasicParsing -Uri $PY_EXE_URL -OutFile $tmp
 
-  # All-Users first
+  # All-Users
   Write-Host "Installing Python (All-Users, silent)..."
   $argsAU = "/quiet InstallAllUsers=1 PrependPath=1 Include_test=0 Include_launcher=1 InstallLauncherAllUsers=1 /log `"$log`""
   Start-Process $tmp -ArgumentList $argsAU -Wait
   Refresh-Path; Start-Sleep -Seconds 2
   $py = Resolve-Python
-  if ($py) { try { Remove-Item $tmp -Force } catch {}; return $py }
+  if ($py) { try { Remove-Item $tmp -Force } catch {}; return @{ Path=$py; Log=$log } }
 
-  # Per-User fallback
+  # Per-User
   Write-Host "All-Users install not visible; retrying Per-User install..."
   $argsPU = "/quiet InstallAllUsers=0 PrependPath=1 Include_test=0 Include_launcher=1 /log `"$log`""
   Start-Process $tmp -ArgumentList $argsPU -Wait
   Refresh-Path; Start-Sleep -Seconds 2
   $py = Resolve-Python
-  if (-not $py) {
-    # Parse TargetDir from log (if present) and probe it directly
-    try {
-      if (Test-Path $log) {
-        $targetLine = Select-String -Path $log -Pattern 'Variable:\s*TargetDir\s*=\s*(.+)$' -SimpleMatch | Select-Object -Last 1
-        if ($targetLine) {
-          $targetDir = ($targetLine.Matches.Value -replace '^Variable:\s*TargetDir\s*=\s*','').Trim()
-          $candidate = Join-Path $targetDir 'python.exe'
-          if (Test-Path $candidate) { $py = $candidate }
-        }
-      }
-    } catch {}
-  }
   try { Remove-Item $tmp -Force } catch {}
+  return @{ Path=$py; Log=$log }
+}
 
-  if (-not $py) {
-    Write-Host "Python installer log (tail): $log" -ForegroundColor Yellow
-    try { Get-Content -Path $log -Tail 80 | ForEach-Object { Write-Host "  $_" } } catch {}
-    throw "Python installation completed but python.exe not resolvable to this session."
+function Install-Python-Embeddable {
+  Ensure-Dir $EMB_DIR
+  $zip = Join-Path $env:TEMP ("python-embed-"+$PY_VERSION+"-"+[guid]::NewGuid().ToString()+".zip")
+  Write-Host "Downloading Python $PY_VERSION (embeddable ZIP)..."
+  Invoke-WebRequest -UseBasicParsing -Uri $PY_ZIP_URL -OutFile $zip
+  Write-Host "Unpacking embeddable..."
+  Add-Type -AssemblyName System.IO.Compression.FileSystem
+  [System.IO.Compression.ZipFile]::ExtractToDirectory($zip, $EMB_DIR)
+  try { Remove-Item $zip -Force } catch {}
+
+  # Enable site in the embeddable distro (uncomment 'import site' in python313._pth)
+  $pth = Get-ChildItem -Path $EMB_DIR -Filter "python*.pth" -File | Select-Object -First 1
+  if ($pth) {
+    $content = Get-Content $pth
+    $content = $content -replace '^\s*#\s*import site\s*$', 'import site'
+    Set-Content -Path $pth -Value $content -Encoding ASCII
   }
-  return $py
+
+  # Bootstrap pip
+  Write-Host "Bootstrapping pip inside embeddable..."
+  $getpip = Join-Path $env:TEMP ("get-pip-"+[guid]::NewGuid().ToString()+".py")
+  Invoke-WebRequest -UseBasicParsing -Uri $GET_PIP_URL -OutFile $getpip
+  $pyexe = Join-Path $EMB_DIR "python.exe"
+  & $pyexe $getpip
+  try { Remove-Item $getpip -Force } catch {}
+
+  # Upgrade pip/wheel
+  & $pyexe -m pip install -U pip wheel | Out-Null
+  return $pyexe
 }
 
 # ----------------- Main flow -----------------
@@ -232,10 +224,23 @@ Ensure-Choco
 Write-Host "[2/12] Installing Git + curl (Chocolatey)..."
 Ensure-GitCurl
 
-Write-Host "[3/12] Installing Python directly from python.org..."
-$PYEXE = Ensure-PythonDirect
+Write-Host "[3/12] Installing Python..."
+# First try EXE (may be blocked by policy)
+$exeRes = Install-Python-EXE
+$PYEXE = $null
+if ($exeRes.Path) {
+  $PYEXE = $exeRes.Path
+  Write-Host ("    - Python (EXE): {0}" -f $PYEXE)
+} else {
+  Write-Host "    - EXE install not available (policy or visibility). Falling back to embeddable ZIP…"
+  if ($exeRes.Log -and (Test-Path $exeRes.Log)) {
+    Write-Host "    (Installer log tail for reference):"
+    try { Get-Content -Path $exeRes.Log -Tail 40 | ForEach-Object { Write-Host "      $_" } } catch {}
+  }
+  $PYEXE = Install-Python-Embeddable
+  Write-Host ("    - Python (embeddable): {0}" -f $PYEXE)
+}
 Check-PyVersion -PyExe $PYEXE | Out-Null
-Write-Host ("    - Python: {0}" -f $PYEXE)
 
 Write-Host "[4/12] Prompting for settings..."
 $GIT_URL  = Read-Default "Git URL"              $GIT_URL_DEFAULT
@@ -258,6 +263,7 @@ $SAFETY   = [int](Read-Default "Safety margin seconds (subtract from each window
 
 $SRC_DIR  = Join-Path $PREFIX "src"
 $VENV_DIR = Join-Path $PREFIX ".venv"
+$EMB_DIR  = Join-Path $PREFIX "pyembed"  # ensure path under chosen prefix for wrappers
 $WRAPPER_PS = Join-Path $BIN_DIR "mtr-logger.ps1"
 $WRAPPER_CMD= Join-Path $BIN_DIR "mtr-logger.cmd"
 $UNINSTALL_PS = Join-Path $BIN_DIR "uninstall.ps1"
@@ -292,15 +298,27 @@ if (-not (Test-Path (Join-Path $SRC_DIR "pyproject.toml"))) {
   Write-Host "pyproject.toml not found in $SRC_DIR" -ForegroundColor Red; exit 1
 }
 
-Write-Host "[7/12] Creating virtualenv: $VENV_DIR"
-Ensure-Dir $VENV_DIR
-& $PYEXE -m venv $VENV_DIR
-$VENV_PY = Join-Path $VENV_DIR "Scripts\python.exe"
-$VENV_PIP= Join-Path $VENV_DIR "Scripts\pip.exe"
+# If we have a full Python (EXE), use venv; if embeddable, just use that interpreter directly
+$UsingEmbeddable = $false
+if ($PYEXE -and ($PYEXE -like "*\pyembed\*")) { $UsingEmbeddable = $true }
 
-Write-Host "[8/12] Installing package (editable)..."
-& $VENV_PIP install -U pip wheel | Out-Null
-& $VENV_PIP install -e $SRC_DIR | Out-Null
+if (-not $UsingEmbeddable) {
+  Write-Host "[7/12] Creating virtualenv: $VENV_DIR"
+  Ensure-Dir $VENV_DIR
+  & $PYEXE -m venv $VENV_DIR
+  $RUN_PY  = Join-Path $VENV_DIR "Scripts\python.exe"
+  $RUN_PIP = Join-Path $VENV_DIR "Scripts\pip.exe"
+  Write-Host "[8/12] Installing package (editable) into venv..."
+  & $RUN_PIP install -U pip wheel | Out-Null
+  & $RUN_PIP install -e $SRC_DIR | Out-Null
+} else {
+  Write-Host "[7/12] Using embeddable Python at $PYEXE (no venv)"
+  $RUN_PY  = $PYEXE
+  $RUN_PIP = "$($PYEXE -replace 'python.exe$','Scripts\pip.exe')"
+  Write-Host "[8/12] Installing package (editable) into embeddable runtime..."
+  & $RUN_PY -m pip install -U pip wheel | Out-Null
+  & $RUN_PY -m pip install -e $SRC_DIR | Out-Null
+}
 
 Write-Host "[9/12] Creating wrapper + uninstall in $BIN_DIR"
 Ensure-Dir $BIN_DIR
@@ -309,7 +327,7 @@ Ensure-Dir $BIN_DIR
 param()
 Write-Host "This will uninstall mtr-logger:" -ForegroundColor Yellow
 Write-Host "  PREFIX:  $PREFIX"
-Write-Host "  VENV:    $VENV_DIR"
+Write-Host "  PY:      $RUN_PY"
 Write-Host "  WRAPPER: $WRAPPER_CMD / $WRAPPER_PS"
 `$ans = Read-Host "Proceed with uninstall? [y/N]"
 if (!(`$ans) -or `$ans.ToLower() -notin @('y','yes')) { Write-Host "Aborted."; exit 0 }
@@ -341,17 +359,17 @@ if (`$Args.Count -gt 0 -and `$Args[0].ToString().ToLower() -eq 'uninstall') {
   & "$UNINSTALL_PS"
   exit `$LASTEXITCODE
 }
-& "$VENV_PY" -m mtrpy @Args
+& "$RUN_PY" -m mtrpy @Args
 "@ | Set-Content -Encoding UTF8 $WRAPPER_PS
 
 @"
 @echo off
-set VENV=$VENV_DIR
 if /I "%~1"=="uninstall" (
   powershell -ExecutionPolicy Bypass -File "$UNINSTALL_PS"
   exit /b %ERRORLEVEL%
 )
-"%VENV%\Scripts\python.exe" -m mtrpy %*
+powershell -NoProfile -ExecutionPolicy Bypass -Command ^
+  "& `"$WRAPPER_PS`" %*"
 "@ | Set-Content -Encoding OEM $WRAPPER_CMD
 
 Write-Host "[10/12] Ensuring $BIN_DIR on system PATH..."
@@ -371,13 +389,13 @@ $logCmd = "`"$WRAPPER_CMD`" `"$TARGET`" --proto `"$PROTO`" --dns `"$DNS_MODE`" -
 schtasks /Delete /TN "$MAIN_TASK" /F 2>$null | Out-Null
 schtasks /Create /TN "$MAIN_TASK" /TR $logCmd /SC MINUTE /MO $stepMin /RU "SYSTEM" /RL HIGHEST /F | Out-Null
 
-$archCmd = "`"$VENV_PY`" -m mtrpy.archiver --retention $ARCHIVE_RETENTION_DEFAULT >> `"$archOut`" 2>&1"
+$archCmd = "`"$RUN_PY`" -m mtrpy.archiver --retention $ARCHIVE_RETENTION_DEFAULT >> `"$archOut`" 2>&1"
 schtasks /Delete /TN "$ARCH_TASK" /F 2>$null | Out-Null
 schtasks /Create /TN "$ARCH_TASK" /TR $archCmd /SC DAILY /ST 00:00 /RU "SYSTEM" /RL HIGHEST /F | Out-Null
 
 Write-Host "[12/12] Self-test..."
 try {
-  & $WRAPPER_CMD $TARGET --proto $PROTO --dns $DNS_MODE -i $INTERVAL --timeout $TIMEOUT -p $PROBES --duration 5 --export --outfile auto | Out-Null
+  & "$WRAPPER_PS" $TARGET --proto $PROTO --dns $DNS_MODE -i $INTERVAL --timeout $TIMEOUT -p $PROBES --duration 5 --export --outfile auto | Out-Null
   Write-Host "    - Self-test invoked."
 } catch {
   Write-Host "    - Self-test not conclusive (ok to ignore)."
