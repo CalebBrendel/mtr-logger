@@ -11,7 +11,7 @@
 #>
 
 param(
-  [string]$InstallerUrl = "https://calebbrendel.com/mtr-logger/windowsp2",
+  [string]$InstallerUrl = "https://calebbrendel.com/mtr-logger/windows",
   [string]$PythonExeUrl = "https://www.python.org/ftp/python/3.12.5/python-3.12.5-amd64.exe",
   [version]$MinPy = [version]"3.8"
 )
@@ -27,13 +27,22 @@ function Require-Admin {
     exit 1
   }
 }
-function Ensure-TLS12 { try { [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12 } catch {} }
+function Ensure-TLS12 {
+  try {
+    [Net.ServicePointManager]::SecurityProtocol =
+      [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
+  } catch {}
+}
 function Refresh-Path {
-  $m=[Environment]::GetEnvironmentVariable('Path','Machine'); $u=[Environment]::GetEnvironmentVariable('Path','User')
-  $env:Path = ($m ?? "") + ";" + ($u ?? "")
+  $m = [Environment]::GetEnvironmentVariable('Path','Machine')
+  $u = [Environment]::GetEnvironmentVariable('Path','User')
+  if ($m -and $u)      { $env:Path = ($m.TrimEnd(';') + ';' + $u) }
+  elseif ($m)          { $env:Path = $m }
+  elseif ($u)          { $env:Path = $u }
+  else                 { $env:Path = "" }
 }
 
-# Registry probing for Python installs
+# Registry probing for Python installs (HKLM/HKCU, 32/64-bit)
 function Get-PythonFromRegistry {
   $roots = @(
     "HKLM:\SOFTWARE\Python\PythonCore",
@@ -49,9 +58,11 @@ function Get-PythonFromRegistry {
       try {
         $ip = Join-Path $verKey "InstallPath"
         if (Test-Path $ip) {
-          $p = (Get-ItemProperty $ip).ExecutablePath
-          if (-not $p) { $p = Join-Path ((Get-ItemProperty $ip).'(default)') "python.exe" -ErrorAction SilentlyContinue }
-          if (-not $p) { $p = Join-Path ((Get-ItemProperty $ip).Path) "python.exe" -ErrorAction SilentlyContinue }
+          $props = Get-ItemProperty $ip
+          $p = $null
+          if ($props.ExecutablePath) { $p = $props.ExecutablePath }
+          if (-not $p -and $props.Path) { $p = Join-Path $props.Path "python.exe" }
+          if (-not $p -and $props.'(default)') { $p = Join-Path $props.'(default)' "python.exe" }
           if ($p -and (Test-Path $p)) { $candidates += $p }
         }
       } catch {}
@@ -62,7 +73,7 @@ function Get-PythonFromRegistry {
 
 # Return a REAL python.exe path without invoking "python" stub
 function Resolve-PythonPath {
-  # 1) py launcher enumeration (only if 'py' exists; don't invoke otherwise)
+  # 1) py launcher enumeration (only if 'py' exists)
   try {
     $pyCmd = Get-Command py -ErrorAction Stop
     $list = & py -0p 2>$null
@@ -74,7 +85,7 @@ function Resolve-PythonPath {
     }
     # Fallback: ask py for concrete path (safe; py exists)
     try {
-      $p = & py -3 -c "import sys; import os; p=sys.executable; print(p if os.path.exists(p) else '')" 2>$null
+      $p = & py -3 -c "import sys,os; p=sys.executable; print(p if p and os.path.exists(p) else '')" 2>$null
       if ($p) { $p=$p.Trim(); if ($p -and (Test-Path $p)) { return $p } }
     } catch {}
   } catch {}
@@ -94,7 +105,7 @@ function Resolve-PythonPath {
   )
   foreach ($p in $common) { if (Test-Path $p) { return $p } }
 
-  # 4) Last resort: if python is on PATH AND points to a real file (not Store alias), accept it
+  # 4) Last resort: python on PATH (real file)
   try {
     $pcmd = Get-Command python -ErrorAction Stop
     if ($pcmd.Source -and (Test-Path $pcmd.Source)) { return $pcmd.Source }
@@ -127,7 +138,7 @@ function Install-Python {
   Refresh-Path; Start-Sleep -Seconds 2
 
   if (-not (Resolve-PythonPath)) {
-    throw "Python installation appears to have failed or is not yet resolvable in this session."
+    throw "Python installation appears to have failed or is not resolvable in this session."
   }
 }
 
