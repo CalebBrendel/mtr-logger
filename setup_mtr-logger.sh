@@ -23,7 +23,7 @@ WRAPPER_DEFAULT="/usr/local/bin/mtr-logger"
 TARGET_DEFAULT="google.ca"
 PROTO_DEFAULT="icmp"
 DNS_DEFAULT="auto"
-INTERVAL_DEFAULT="0.3"   # interactive default
+INTERVAL_DEFAULT="0.3"
 TIMEOUT_DEFAULT="0.3"
 PROBES_DEFAULT="3"
 FPS_DEFAULT="6"
@@ -35,13 +35,12 @@ SAFETY_MARGIN_DEFAULT="5"
 ARCHIVE_RETENTION_DEFAULT="90"
 # --------------------------------------------
 
-# ----------- Small helpers -----------
 sanitize_input() {
   sed -E 's/\x1B\[[0-9;]*[A-Za-z]//g' | tr -cd '\11\12\15\40-\176' | sed -E 's/^[[:space:]]+//; s/[[:space:]]+$//'
 }
 is_valid_git_url(){ case "${1:-}" in https://*|git@*:* ) return 0;; *) return 1;; esac; }
 ask(){ local l="$1" d="$2" a=""; if [[ -t 0 ]]; then read -r -p "$l [$d]: " a; else read -r -p "$l [$d]: " a < /dev/tty; fi; a="$(printf "%s" "${a:-$d}"|sanitize_input)"; printf "%s\n" "$a"; }
-ask_yn(){ local l="$1" d="$2" a=""; local def="${d,,}"; local def_hint; [[ "$def" == "yes" ]] && def_hint="Y/n" || def_hint="y/N"; read -r -p "$l [$def_hint]: " a </dev/tty || a=""; a="$(sanitize_input <<<"${a:-}")"; a="${a:-$d}"; case "${a,,}" in y|yes) echo "yes";; n|no) echo "no";; *) echo "$d";; esac; }
+ask_yn(){ local l="$1" d="${2:-Y}" a=""; read -r -p "$l [${d}]: " a || true; a="$(printf "%s" "${a:-$d}"|sanitize_input)"; case "$a" in [Yy]|[Yy][Ee][Ss]) echo "Y";; [Nn]|[Nn][Oo]) echo "N";; *) echo "$d";; esac; }
 require_root(){ [[ ${EUID:-$(id -u)} -eq 0 ]] || { echo "Please run as root (sudo)."; exit 1; }; }
 
 detect_pm(){
@@ -91,13 +90,15 @@ start_cron_service(){
   if pgrep -x cron >/dev/null 2>&1 || pgrep -x crond >/dev/null 2>&1; then echo "    - cron/crond is running"; else echo "    - Could not verify an active cron unit; please check manually."; fi
 }
 validate_factor_of_60(){ case "$1" in 1|2|3|4|5|6|10|12|15|20|30|60) return 0;; *) return 1;; esac; }
+
 minutes_list(){
   local n="$1"
   local step=$((60 / n))
-  local out="" m=0
+  local out=""; local m=0
   while (( m < 60 )); do out+="${m},"; m=$((m + step)); done
   printf '%s\n' "${out%,}"
 }
+
 try_setcap_cap_net_raw(){
   local pybin="$1"
   [[ -x "$pybin" ]] || { echo "    - Python binary not found at $pybin (skipping setcap)."; return 1; }
@@ -108,178 +109,188 @@ try_setcap_cap_net_raw(){
   return 0
 }
 detect_current_tz(){
-  if command -v timedatectl >/dev/null 2>&1; then
-    tz="$(timedatectl show -p Timezone --value 2>/dev/null || true)"
-    [[ -n "${tz:-}" ]] && { printf "%s\n" "$tz"; return; }
-  fi
+  if command -v timedatectl >/dev/null 2>&1; then tz="$(timedatectl show -p Timezone --value 2>/dev/null || true)"; [[ -n "${tz:-}" ]] && { printf "%s\n" "$tz"; return; }; fi
   [[ -f /etc/timezone ]] && { tr -d '\n\r' < /etc/timezone; echo; return; }
-  echo "UTC"
+  echo "Etc/UTC"
 }
 current_time_in_tz(){
   local tz="$1"
-  TZ="$tz" date +"%Y-%m-%d %H:%M:%S %Z"
+  TZ="$tz" date "+%Y-%m-%d %H:%M:%S (%Z)"
 }
 
-# ---------- Timezone list helpers ----------
 _collect_timezones(){
+  # Prefer tzdata list if present; otherwise walk zoneinfo
   if command -v timedatectl >/dev/null 2>&1; then
     timedatectl list-timezones 2>/dev/null || true
     return
   fi
-  if [[ -d /usr/share/zoneinfo ]]; then
-    (cd /usr/share/zoneinfo >/dev/null 2>&1 || exit 0; find . -type f | sed 's#^\./##' | grep -E '^[A-Za-z]+/|^(UTC|GMT|Zulu)$')
-  fi
+  find /usr/share/zoneinfo -type f \
+    ! -path '*/posix/*' ! -path '*/right/*' \
+    ! -name 'posixrules' ! -name 'localtime' \
+    | sed 's|^/usr/share/zoneinfo/||' \
+    | grep -E '^[A-Za-z]+' \
+    | sort -u
 }
-list_timezones_all(){
-  local pager="less -R"
-  command -v less >/dev/null 2>&1 || pager="more"
-  if command -v timedatectl >/dev/null 2>&1; then
-    timedatectl list-timezones | $pager
-  else
-    _collect_timezones | sort -u | $pager
+
+tz_wizard_apply(){
+  local tz="$1"
+  echo
+  echo "Preview current time in ${tz}: $(current_time_in_tz "$tz")"
+  if [[ "$(ask_yn "Use this timezone?" "Y")" == "N" ]]; then
+    echo "  - Not applying '${tz}'."
+    return 1
   fi
-}
-list_timezones_region(){
-  local region="$1" pager="less -R"
-  command -v less >/dev/null 2>&1 || pager="more"
   if command -v timedatectl >/dev/null 2>&1; then
-    timedatectl list-timezones | grep -E "^${region}/" | $pager
-  else
-    _collect_timezones | grep -E "^${region}/" | sort -u | $pager
+    if timedatectl set-timezone "$tz" 2>/dev/null; then
+      echo "  - System timezone set via timedatectl → ${tz}"
+      return 0
+    fi
   fi
-}
-search_timezones(){
-  local kw="$1" limit="${2:-50}"
-  if command -v timedatectl >/dev/null 2>&1; then
-    timedatectl list-timezones | grep -i -- "$kw" | head -n "$limit"
+  # Fallback symlink for non-systemd
+  if [[ -f "/usr/share/zoneinfo/${tz}" ]]; then
+    ln -sf "/usr/share/zoneinfo/${tz}" /etc/localtime
+    echo "${tz}" >/etc/timezone || true
+    echo "  - System timezone set via /etc/localtime symlink → ${tz}"
+    return 0
   else
-    _collect_timezones | grep -i -- "$kw" | sort -u | head -n "$limit"
+    echo "  - Could not locate /usr/share/zoneinfo/${tz}; not applied."
+    return 1
   fi
 }
 
-# ---------- Interactive TZ picker ----------
-choose_timezone_interactive() {
-  local current="$1"
-  local pick=""
-  local input=""
-  local tzs_all=""
+tz_wizard(){
+  local detected="$1"
+  echo
+  echo "[TZ] Detected host timezone: ${detected}"
+  if [[ "$(ask_yn "Is this the correct timezone?" "Y")" == "Y" ]]; then
+    echo "  - Keeping current timezone (${detected})."
+    echo "$detected"
+    return 0
+  fi
+  if [[ "$(ask_yn "Do you want to change the system timezone now?" "Y")" == "N" ]]; then
+    echo "  - Leaving timezone unchanged (${detected})."
+    echo "$detected"
+    return 0
+  fi
 
-  if command -v timedatectl >/dev/null 2>&1; then
-    tzs_all="$(timedatectl list-timezones 2>/dev/null || true)"
-  else
-    tzs_all="$(_collect_timezones | grep -E '^[A-Za-z]+/|^(UTC|GMT|Zulu)$' | sort -u)"
+  # Load list once
+  mapfile -t ALL_TZ < <(_collect_timezones)
+  if [[ "${#ALL_TZ[@]}" -eq 0 ]]; then
+    echo "  - Could not enumerate timezones. You can enter an exact IANA name next."
   fi
 
   while true; do
     echo
-    echo "Timezone helper:"
-    echo "  1) Browse all (pager)"
-    echo "  2) Browse by region (America, Europe, Asia, Africa, Australia, Pacific, Indian, Atlantic, Antarctica, Arctic)"
-    echo "  3) Search by keyword (recommended)"
-    echo "  4) Enter exact timezone (e.g., America/Chicago)"
-    echo "  5) Cancel / keep current ($current)"
-    echo
-    echo "Tip: You can also type an exact IANA name here (e.g., America/Chicago) and press Enter."
-    input="$(ask 'Choose an option' '3')"
+    cat <<MENU
+Browse/search, or enter exactly (examples: America/Chicago, Europe/Berlin)
 
-    # Direct IANA name accepted at main prompt
-    if [[ "$input" == */* || "$input" =~ ^(UTC|GMT|Zulu)$ ]]; then
-      pick="$input"
-      if command -v timedatectl >/dev/null 2>&1; then
-        if ! printf "%s\n" "$tzs_all" | grep -Fxq "$pick"; then
-          echo "Not a recognized timezone: $pick"
-          pick=""; continue
-        fi
-      else
-        [[ -f "/usr/share/zoneinfo/$pick" ]] || { echo "No such file: /usr/share/zoneinfo/$pick"; pick=""; continue; }
-      fi
-      echo "Current time in $pick: $(current_time_in_tz "$pick")"
-      [[ "$(ask_yn 'Use this timezone?' 'yes')" == "yes" ]] && { printf "%s\n" "$pick"; return 0; }
-      pick=""; continue
-    fi
+[1] Browse by region (continents)
+[2] Search by keyword (city/region substring)
+[3] Enter exact IANA timezone
+[4] Keep current timezone (${detected})
+[5] Cancel timezone change
 
-    case "${input,,}" in
-      1|browse|b)
-        list_timezones_all || true
-        ;;
-      2|region|r)
-        local region; region="$(ask 'Region' 'America')"
-        case "$region" in
-          America|Europe|Asia|Africa|Australia|Pacific|Indian|Atlantic|Antarctica|Arctic)
-            list_timezones_region "$region" || true
-            ;;
-          *)
-            echo "Unknown region. Try: America Europe Asia Africa Australia Pacific Indian Atlantic Antarctica Arctic"
-            ;;
-        esac
-        ;;
-      3|search|s)
-        local kw; kw="$(ask 'Search keyword (e.g., Chicago)' '')"
-        if [[ -n "$kw" ]]; then
-          echo "Matches (top 50):"
-          search_timezones "$kw" 50 || true
-          echo
-          pick="$(ask 'Enter exact timezone from the matches (or leave blank to continue)' '')"
-          if [[ -n "$pick" ]]; then
-            if command -v timedatectl >/dev/null 2>&1; then
-              printf "%s\n" "$tzs_all" | grep -Fxq "$pick" || { echo "Not a recognized timezone: $pick"; pick=""; continue; }
-            else
-              [[ -f "/usr/share/zoneinfo/$pick" ]] || { echo "No such file: /usr/share/zoneinfo/$pick"; pick=""; continue; }
-            fi
-            echo "Current time in $pick: $(current_time_in_tz "$pick")"
-            [[ "$(ask_yn 'Use this timezone?' 'yes')" == "yes" ]] && { printf "%s\n" "$pick"; return 0; }
-            pick=""
-          fi
+Type 1-5 and press Enter.
+MENU
+    read -r -p "Choose an option [4]: " opt_raw || true
+    opt_raw="$(printf "%s" "${opt_raw:-4}" | sanitize_input)"
+
+    case "$opt_raw" in
+      1)
+        # Regions are the first path element before '/'
+        mapfile -t REGIONS < <(printf '%s\n' "${ALL_TZ[@]}" | awk -F/ 'NF>1{print $1}' | sort -u)
+        echo
+        echo "Regions:"
+        local idx=1
+        for r in "${REGIONS[@]}"; do printf "  %2d) %s\n" "$idx" "$r"; idx=$((idx+1)); done
+        read -r -p "Pick a region by number or name (e.g., 1 or America): " pick || true
+        pick="$(sanitize_input <<<"${pick:-}")"
+        local region=""
+        if [[ "$pick" =~ ^[0-9]+$ ]] && (( pick>=1 && pick<=${#REGIONS[@]} )); then
+          region="${REGIONS[$((pick-1))]}"
         else
-          echo "No keyword entered."
+          region="$pick"
+        fi
+        if [[ -z "$region" ]]; then echo "  - No region chosen."; continue; fi
+
+        mapfile -t ZONES_IN_REGION < <(printf '%s\n' "${ALL_TZ[@]}" | awk -F/ -v r="$region" 'index($0, r"/")==1')
+        if [[ "${#ZONES_IN_REGION[@]}" -eq 0 ]]; then
+          echo "  - No zones found under region '${region}'."
+          continue
+        fi
+        echo
+        echo "Zones in ${region}:"
+        idx=1
+        for z in "${ZONES_IN_REGION[@]}"; do
+          printf "  %2d) %s\n" "$idx" "$z"
+          (( idx>=30 )) && { echo "  ... (showing first 30)"; break; }
+          idx=$((idx+1))
+        done
+        read -r -p "Enter number (1-${idx-1}) or exact zone (e.g., ${region}/Chicago): " zp || true
+        zp="$(sanitize_input <<<"${zp:-}")"
+        local chosen=""
+        if [[ "$zp" =~ ^[0-9]+$ ]] && (( zp>=1 && zp<idx )); then
+          chosen="${ZONES_IN_REGION[$((zp-1))]}"
+        else
+          chosen="$zp"
+        fi
+        if [[ -n "$chosen" ]]; then
+          tz_wizard_apply "$chosen" && { echo "$chosen"; return 0; }
         fi
         ;;
-      4|enter|e)
-        pick="$(ask 'Enter exact timezone (e.g., America/Chicago)' "$current")"
-        [[ -n "$pick" ]] || { echo "No timezone entered."; continue; }
-        if command -v timedatectl >/dev/null 2>&1; then
-          printf "%s\n" "$tzs_all" | grep -Fxq "$pick" || { echo "Not a recognized timezone: $pick"; pick=""; continue; }
-        else
-          [[ -f "/usr/share/zoneinfo/$pick" ]] || { echo "No such file: /usr/share/zoneinfo/$pick"; pick=""; continue; }
+
+      2)
+        read -r -p "Search keyword (e.g., Chicago or Berlin) []: " kw || true
+        kw="$(sanitize_input <<<"${kw:-}")"
+        if [[ -z "$kw" ]]; then echo "  - No keyword entered."; continue; fi
+        mapfile -t MATCHES < <(printf '%s\n' "${ALL_TZ[@]}" | grep -i -- "$kw" | head -n 30)
+        if [[ "${#MATCHES[@]}" -eq 0 ]]; then
+          echo "  - No matches for '$kw'. Try another keyword."
+          continue
         fi
-        echo "Current time in $pick: $(current_time_in_tz "$pick")"
-        [[ "$(ask_yn 'Use this timezone?' 'yes')" == "yes" ]] && { printf "%s\n" "$pick"; return 0; }
-        pick=""
+        echo
+        echo "Matches (pick by number or type exact name):"
+        idx=1
+        for m in "${MATCHES[@]}"; do printf "  %2d) %s\n" "$idx" "$m"; idx=$((idx+1)); done
+        read -r -p "Your choice: " mm || true
+        mm="$(sanitize_input <<<"${mm:-}")"
+        local chosen=""
+        if [[ "$mm" =~ ^[0-9]+$ ]] && (( mm>=1 && mm<=${#MATCHES[@]} )); then
+          chosen="${MATCHES[$((mm-1))]}"
+        else
+          chosen="$mm"
+        fi
+        if [[ -n "$chosen" ]]; then
+          tz_wizard_apply "$chosen" && { echo "$chosen"; return 0; }
+        fi
         ;;
-      5|cancel|c)
-        echo "$current"
+
+      3)
+        read -r -p "Enter exact IANA timezone (e.g., America/Chicago): " tz || true
+        tz="$(sanitize_input <<<"${tz:-}")"
+        [[ -z "$tz" ]] && { echo "  - Empty timezone."; continue; }
+        tz_wizard_apply "$tz" && { echo "$tz"; return 0; }
+        ;;
+
+      4)
+        echo "  - Keeping current timezone (${detected})."
+        echo "$detected"
         return 0
         ;;
+
+      5)
+        echo "  - Cancelled timezone change; keeping ${detected}."
+        echo "$detected"
+        return 0
+        ;;
+
       *)
-        echo "Invalid choice. Type 1–5, or type an exact timezone (e.g., America/Chicago)."
+        echo "  - Invalid option. Please type 1, 2, 3, 4, or 5."
         ;;
     esac
   done
 }
 
-apply_timezone_if_requested(){
-  local current="$1"
-  echo
-  echo "[TZ] Detected host timezone: $current"
-  if [[ "$(ask_yn 'Is this the correct timezone?' 'yes')" == "no" ]]; then
-    if [[ "$(ask_yn 'Do you want to change the system timezone now?' 'yes')" == "yes" ]]; then
-      echo
-      echo "Browse/search, or type an exact IANA name (e.g., America/Chicago) when prompted."
-      local new_tz; new_tz="$(choose_timezone_interactive "$current")"
-      if [[ -n "$new_tz" && "$new_tz" != "$current" ]]; then
-        echo "Applying timezone: $new_tz"
-        if command -v timedatectl >/dev/null 2>&1; then
-          timedatectl set-timezone "$new_tz" || { echo "timedatectl failed. Falling back to /etc/localtime."; ln -sf "/usr/share/zoneinfo/$new_tz" /etc/localtime; echo "$new_tz" > /etc/timezone || true; }
-        else
-          ln -sf "/usr/share/zoneinfo/$new_tz" /etc/localtime
-          echo "$new_tz" > /etc/timezone || true
-        fi
-      fi
-    fi
-  fi
-}
-
-# ----------------- Main -----------------
 main(){
   require_root
   print_logo
@@ -289,12 +300,11 @@ main(){
   install_deps "$PM"
   start_cron_service
 
-  # --- Timezone confirm / change ---
+  # --- Timezone wizard (clear menu + previews) ---
   CURRENT_TZ="$(detect_current_tz)"
-  apply_timezone_if_requested "$CURRENT_TZ"
-  CURRENT_TZ="$(detect_current_tz)"
+  CRON_TZ_VAL="$(tz_wizard "$CURRENT_TZ")"
 
-  # --- Config prompts ---
+  # --- Regular prompts ---
   GIT_URL="$(ask "Git URL" "$GIT_URL_DEFAULT")"; is_valid_git_url "$GIT_URL" || { echo "WARNING: invalid URL; using default."; GIT_URL="$GIT_URL_DEFAULT"; }
   BRANCH="$(ask "Branch" "$BRANCH_DEFAULT")"
   PREFIX="$(ask "Install prefix" "$PREFIX_DEFAULT")"
@@ -309,13 +319,13 @@ main(){
   FPS="$(ask "TUI FPS (interactive only)" "$FPS_DEFAULT")"
   ASCII="$(ask "Use ASCII borders? (yes/no)" "$ASCII_DEFAULT")"
   USE_SCREEN="$(ask "Use alternate screen? (yes/no)" "$USE_SCREEN_DEFAULT")"
-  CRON_TZ_VAL="$(ask "Time zone for scheduling (IANA, e.g. America/Chicago)" "$CURRENT_TZ")"
 
   LPH="$(ask "How many logs per hour (must divide 60 evenly)" "$LOGS_PER_HOUR_DEFAULT")"
   validate_factor_of_60 "$LPH" || { echo "ERROR: $LPH does not evenly divide 60."; exit 2; }
   SAFETY="$(ask "Safety margin seconds (subtract from each window)" "$SAFETY_MARGIN_DEFAULT")"
 
   SRC_DIR="$PREFIX/src"; VENV_DIR="$PREFIX/.venv"
+
   STEP_MIN=$((60 / LPH)); WINDOW_SEC=$((STEP_MIN * 60)); DURATION=$((WINDOW_SEC - SAFETY)); [[ $DURATION -gt 0 ]] || { echo "ERROR: Safety too large."; exit 2; }
   MINUTES="$(minutes_list "$LPH")"
 
@@ -398,7 +408,7 @@ Archiver (daily 00:00 in $CRON_TZ_VAL):
   $CRONLINE_ARCHIVE
 
 Notes:
-- If CAP_NET_RAW couldn't be applied, ICMP may need sudo; 'tcp' works unprivileged
+- If CAP_NET_RAW couldn't be applied, ICMP may need sudo; 'tcp' works unprivileged:
     mtr-logger $TARGET --proto tcp
 - Logs live in ~/mtr/logs; archives in ~/mtr/logs/archive/MM-DD-YYYY (dated in TZ=$CRON_TZ_VAL)
 - Retention is 90 days by default; edit root crontab to change.
