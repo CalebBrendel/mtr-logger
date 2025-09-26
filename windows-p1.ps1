@@ -1,10 +1,8 @@
 <#  windows-onefile.ps1 — One-command Windows installer for mtr-logger (PowerShell 5.1)
-    v6.1:
-      - Embeddable Python path is idempotent:
-          * If pyembed\python.exe exists, reuse it (skip unzip)
-          * If pyembed exists but is partial, remove & re-extract
-      - Keeps EXE-first install; falls back on MSI policy block (0x659)
-      - get-pip output fully redirected to a log and verified
+    v6.2:
+      - If embeddable Python is reused and pip is missing, auto-bootstrap pip (get-pip) and verify
+      - Scheduled Tasks: safe query-before-delete; ignore missing tasks cleanly
+      - EXE-first Python install, fallback to embeddable ZIP; idempotent reruns
 #>
 
 $ErrorActionPreference = 'Stop'
@@ -35,8 +33,8 @@ $GET_PIP_URL = "https://bootstrap.pypa.io/get-pip.py"
 
 # Derived (recomputed after prompts)
 $SRC_DIR   = Join-Path $PREFIX_DEFAULT "src"
-$VENV_DIR  = Join-Path $PREFIX_DEFAULT ".venv"   # full Python
-$EMB_DIR   = Join-Path $PREFIX_DEFAULT "pyembed" # embeddable fallback
+$VENV_DIR  = Join-Path $PREFIX_DEFAULT ".venv"
+$EMB_DIR   = Join-Path $PREFIX_DEFAULT "pyembed"
 $WRAPPER_PS= Join-Path $BIN_DIR_DEFAULT "mtr-logger.ps1"
 $WRAPPER_CMD=Join-Path $BIN_DIR_DEFAULT "mtr-logger.cmd"
 $UNINSTALL_PS = Join-Path $BIN_DIR_DEFAULT "uninstall.ps1"
@@ -124,7 +122,6 @@ function Resolve-Python {
   try { $pc=Get-Command python -ErrorAction Stop; if($pc.Source -and (Test-Path $pc.Source)){ return $pc.Source } } catch {}
   return $null
 }
-
 function Check-PyVersion([string]$PyExe, [version]$MinVersion = [version]"3.8") {
   $v = & $PyExe -c "import sys;print('.'.join(map(str,sys.version_info[:3])))"
   $v = ($v | Select-Object -First 1).Trim()
@@ -176,17 +173,14 @@ function Install-Python-EXE {
 }
 
 function Install-Python-Embeddable {
-  # Idempotent: reuse existing if present
+  # Idempotent reuse if present
   $existing = Join-Path $EMB_DIR "python.exe"
   if (Test-Path $existing) {
     Write-Host "Embeddable Python already present at $existing — reusing."
     return $existing
   }
-
   # Clean target if partially present
-  if (Test-Path $EMB_DIR) {
-    try { Remove-Item -Recurse -Force $EMB_DIR } catch {}
-  }
+  if (Test-Path $EMB_DIR) { try { Remove-Item -Recurse -Force $EMB_DIR } catch {} }
   Ensure-Dir $EMB_DIR
 
   $zip   = Join-Path $env:TEMP ("python-embed-"+$PY_VERSION+"-"+[guid]::NewGuid().ToString()+".zip")
@@ -221,7 +215,6 @@ function Install-Python-Embeddable {
     $ver = & $pyexe -m pip --version 2>$null
     if ($LASTEXITCODE -eq 0 -and $ver) { $pipOk = $true }
   } catch { $pipOk = $false }
-
   if (-not $pipOk) {
     Write-Host "get-pip output (tail): $pipLog" -ForegroundColor Yellow
     try { Get-Content -Path $pipLog -Tail 80 | ForEach-Object { Write-Host "  $_" } } catch {}
@@ -233,6 +226,47 @@ function Install-Python-Embeddable {
     -RedirectStandardOutput $pipLog -RedirectStandardError $pipLog -NoNewWindow -Wait
 
   return $pyexe
+}
+
+function Ensure-Embeddable-Pip([string]$PyExe) {
+  # Re-bootstrap pip if missing in reused embeddable
+  try {
+    & $PyExe -m pip --version 2>$null | Out-Null
+    if ($LASTEXITCODE -eq 0) { return }
+  } catch {}
+  Write-Host "pip not found in embeddable — installing now..."
+  $pipLog= Join-Path $env:TEMP ("getpip-repair-"+(Get-Date -Format "yyyyMMdd-HHmmss")+".log")
+  $getpip = Join-Path $env:TEMP ("get-pip-"+[guid]::NewGuid().ToString()+".py")
+  Invoke-WebRequest -UseBasicParsing -Uri $GET_PIP_URL -OutFile $getpip
+  Start-Process -FilePath $PyExe -ArgumentList "`"$getpip`" --no-warn-script-location" `
+    -RedirectStandardOutput $pipLog -RedirectStandardError $pipLog -NoNewWindow -Wait
+  try { Remove-Item $getpip -Force } catch {}
+  # verify
+  & $PyExe -m pip --version 2>$null | Out-Null
+  if ($LASTEXITCODE -ne 0) {
+    Write-Host "get-pip repair log (tail):" -ForegroundColor Yellow
+    try { Get-Content -Path $pipLog -Tail 80 | ForEach-Object { Write-Host "  $_" } } catch {}
+    throw "pip still missing in embeddable runtime."
+  }
+}
+
+# --------- Scheduled Task helpers (safe/quiet) ---------
+function Task-Exists([string]$Name) {
+  cmd /c "schtasks /Query /TN `"$Name`" >NUL 2>&1"
+  return ($LASTEXITCODE -eq 0)
+}
+function Task-Delete-IfExists([string]$Name) {
+  if (Task-Exists $Name) {
+    cmd /c "schtasks /Delete /TN `"$Name`" /F >NUL 2>&1"
+  }
+}
+function Task-Create([string]$Name, [string]$Cmd, [string]$Schedule, [string]$Mo = "", [string]$StartTime = "") {
+  # $Schedule: MINUTE|DAILY, optional $Mo (e.g. "5"), optional $StartTime ("HH:MM")
+  $common = @("/TN", $Name, "/TR", $Cmd, "/RU", "SYSTEM", "/RL", "HIGHEST", "/F")
+  $args = @("/Create") + $common + @("/SC", $Schedule)
+  if ($Mo)       { $args += @("/MO", $Mo) }
+  if ($StartTime){ $args += @("/ST", $StartTime) }
+  Start-Process -FilePath schtasks.exe -ArgumentList $args -NoNewWindow -Wait
 }
 
 # ----------------- Main flow -----------------
@@ -328,21 +362,21 @@ if (-not (Test-Path (Join-Path $SRC_DIR "pyproject.toml"))) {
   Write-Host "pyproject.toml not found in $SRC_DIR" -ForegroundColor Red; exit 1
 }
 
-# If we have full Python (EXE), use venv; if embeddable, use interpreter directly
+# Interpreter selection
 $UsingEmbeddable = ($PYEXE -like "*\pyembed\*")
-
-if (-not $UsingEmbeddable) {
+if ($UsingEmbeddable) {
+  Write-Host "[7/12] Using embeddable Python at $PYEXE (no venv)"
+  Ensure-Embeddable-Pip -PyExe $PYEXE
+  $RUN_PY = $PYEXE
+  Write-Host "[8/12] Installing package (editable) into embeddable runtime..."
+  & $RUN_PY -m pip install -U pip wheel | Out-Null
+  & $RUN_PY -m pip install -e $SRC_DIR | Out-Null
+} else {
   Write-Host "[7/12] Creating virtualenv: $VENV_DIR"
   Ensure-Dir $VENV_DIR
   & $PYEXE -m venv $VENV_DIR
   $RUN_PY  = Join-Path $VENV_DIR "Scripts\python.exe"
   Write-Host "[8/12] Installing package (editable) into venv..."
-  & $RUN_PY -m pip install -U pip wheel | Out-Null
-  & $RUN_PY -m pip install -e $SRC_DIR | Out-Null
-} else {
-  Write-Host "[7/12] Using embeddable Python at $PYEXE (no venv)"
-  $RUN_PY  = $PYEXE
-  Write-Host "[8/12] Installing package (editable) into embeddable runtime..."
   & $RUN_PY -m pip install -U pip wheel | Out-Null
   & $RUN_PY -m pip install -e $SRC_DIR | Out-Null
 }
@@ -360,8 +394,8 @@ Write-Host "  WRAPPER: $WRAPPER_CMD / $WRAPPER_PS"
 if (!(`$ans) -or `$ans.ToLower() -notin @('y','yes')) { Write-Host "Aborted."; exit 0 }
 
 Write-Host "[1/5] Removing Scheduled Tasks..."
-schtasks /Delete /TN "$MAIN_TASK" /F 2>`$null | Out-Null
-schtasks /Delete /TN "$ARCH_TASK" /F 2>`$null | Out-Null
+cmd /c "schtasks /Delete /TN `"$MAIN_TASK`" /F >NUL 2>&1"
+cmd /c "schtasks /Delete /TN `"$ARCH_TASK`" /F >NUL 2>&1"
 
 Write-Host "[2/5] Removing install dir..."
 if (Test-Path "$PREFIX") { Remove-Item -Recurse -Force "$PREFIX" }
@@ -412,13 +446,15 @@ Ensure-Dir $LOG_DIR
 $logOut = Join-Path $env:USERPROFILE "mtr-logger.log"
 $archOut= Join-Path $env:USERPROFILE "mtr-logger-archive.log"
 
+# Delete if exist (quiet), then create
+Task-Delete-IfExists $MAIN_TASK
+Task-Delete-IfExists $ARCH_TASK
+
 $logCmd = "`"$WRAPPER_CMD`" `"$TARGET`" --proto `"$PROTO`" --dns `"$DNS_MODE`" -i `"$INTERVAL`" --timeout `"$TIMEOUT`" -p `"$PROBES`" --duration $duration --export --outfile auto >> `"$logOut`" 2>&1"
-schtasks /Delete /TN "$MAIN_TASK" /F 2>$null | Out-Null
-schtasks /Create /TN "$MAIN_TASK" /TR $logCmd /SC MINUTE /MO $stepMin /RU "SYSTEM" /RL HIGHEST /F | Out-Null
+Task-Create -Name $MAIN_TASK -Cmd $logCmd -Schedule "MINUTE" -Mo "$stepMin"
 
 $archCmd = "`"$RUN_PY`" -m mtrpy.archiver --retention $ARCHIVE_RETENTION_DEFAULT >> `"$archOut`" 2>&1"
-schtasks /Delete /TN "$ARCH_TASK" /F 2>$null | Out-Null
-schtasks /Create /TN "$ARCH_TASK" /TR $archCmd /SC DAILY /ST 00:00 /RU "SYSTEM" /RL HIGHEST /F | Out-Null
+Task-Create -Name $ARCH_TASK -Cmd $archCmd -Schedule "DAILY" -StartTime "00:00"
 
 Write-Host "[12/12] Self-test..."
 try {
