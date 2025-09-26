@@ -4,14 +4,10 @@
     - Resolves a REAL python.exe (py launcher, registry, well-known paths)
     - Verifies minimum Python version
     - Downloads & runs second-stage installer
-
-    Usage (elevated):
-      Set-ExecutionPolicy Bypass -Scope Process -Force
-      irm https://raw.githubusercontent.com/CalebBrendel/mtr-logger/refs/heads/main/windows-p1.ps1 | iex
 #>
 
 param(
-  [string]$InstallerUrl = "https://calebbrendel.com/mtr-logger/windowsp2",
+  [string]$InstallerUrl = "https://calebbrendel.com/mtr-logger/windows-p2.ps1",  # point to your main installer
   [string]$PythonExeUrl = "https://www.python.org/ftp/python/3.12.5/python-3.12.5-amd64.exe",
   [version]$MinPy = [version]"3.8"
 )
@@ -71,9 +67,9 @@ function Get-PythonFromRegistry {
   $candidates | Select-Object -Unique
 }
 
-# Return a REAL python.exe path without invoking "python" stub
+# Return a REAL python.exe path without invoking the MS-Store “python” alias
 function Resolve-PythonPath {
-  # 1) py launcher enumeration (only if 'py' exists)
+  # 1) py launcher
   try {
     $pyCmd = Get-Command py -ErrorAction Stop
     $list = & py -0p 2>$null
@@ -83,7 +79,6 @@ function Resolve-PythonPath {
         if ($exe -and (Test-Path $exe) -and ($exe -like "*\python.exe")) { return $exe }
       }
     }
-    # Fallback: ask py for concrete path (safe; py exists)
     try {
       $p = & py -3 -c "import sys,os; p=sys.executable; print(p if p and os.path.exists(p) else '')" 2>$null
       if ($p) { $p=$p.Trim(); if ($p -and (Test-Path $p)) { return $p } }
@@ -105,12 +100,11 @@ function Resolve-PythonPath {
   )
   foreach ($p in $common) { if (Test-Path $p) { return $p } }
 
-  # 4) Last resort: python on PATH (real file)
+  # 4) Last resort: python on PATH (only accept if it’s a real file path)
   try {
     $pcmd = Get-Command python -ErrorAction Stop
     if ($pcmd.Source -and (Test-Path $pcmd.Source)) { return $pcmd.Source }
   } catch {}
-
   return $null
 }
 
@@ -144,7 +138,6 @@ function Install-Python {
 
 function Check-Python-Version {
   param([string]$PyPath, [version]$MinVersion)
-  # Call the concrete path directly; never 'python' or 'py'
   $v = & $PyPath -c "import sys; print('.'.join(map(str, sys.version_info[:3])))"
   $v = ($v | Select-Object -First 1).Trim()
   if (-not ($v -match '^\d+\.\d+(\.\d+)?$')) { throw "Could not parse Python version string: '$v'" }
