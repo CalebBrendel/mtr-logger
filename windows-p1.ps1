@@ -1,9 +1,10 @@
 <#  windows-onefile.ps1 — One-command Windows installer for mtr-logger (PowerShell 5.1)
-    v3: Python install is now bullet-proof:
-      - All-Users then Per-User EXE
-      - Remove WindowsApps stubs
-      - Resolve via py launcher, registry, known paths, then quick scan
-      - /log PythonInstall.log and show tail on failure
+    v4:
+      - Python EXE: All-Users then Per-User
+      - Removes MS Store stubs
+      - Resolves python.exe via: py launcher, registry, known paths,
+        quick scans (incl. C:\Users\*\...\Python313), and
+        finally by parsing the Python installer log for TargetDir
 #>
 
 $ErrorActionPreference = 'Stop'
@@ -71,33 +72,29 @@ function Remove-StorePythonStubs {
 
 # --- Python resolvers ---
 function Resolve-Python-FromRegistry {
-  $keys = @(
+  $roots = @(
     "HKLM:\SOFTWARE\Python\PythonCore",
     "HKLM:\SOFTWARE\WOW6432Node\Python\PythonCore",
     "HKCU:\SOFTWARE\Python\PythonCore"
   )
   $cands = @()
-  foreach($root in $keys){
+  foreach($root in $roots){
     try {
       if(Test-Path $root){
         Get-ChildItem $root -ErrorAction Stop | ForEach-Object {
-          $verKey = $_.PSPath
-          try {
-            $ip = Join-Path $verKey "InstallPath"
-            if(Test-Path $ip){
-              $path = (Get-ItemProperty -Path $ip -Name "(default)" -ErrorAction SilentlyContinue)."(default)"
-              if($path -and (Test-Path (Join-Path $path "python.exe"))){
-                $cands += (Join-Path $path "python.exe")
-              }
+          $ip = Join-Path $_.PSPath "InstallPath"
+          if(Test-Path $ip){
+            $path = (Get-ItemProperty -Path $ip -Name "(default)" -ErrorAction SilentlyContinue)."(default)"
+            if($path){
+              $exe = Join-Path $path "python.exe"
+              if(Test-Path $exe){ $cands += $exe }
             }
-          } catch {}
+          }
         }
       }
     } catch {}
   }
-  # choose highest version by folder name heuristic
-  $best = $cands | Sort-Object -Descending -Unique | Select-Object -First 1
-  return $best
+  $cands | Sort-Object -Descending -Unique | Select-Object -First 1
 }
 
 function Resolve-Python {
@@ -117,8 +114,8 @@ function Resolve-Python {
     "$env:LOCALAPPDATA\Programs\Python\Python313\python.exe","$env:LOCALAPPDATA\Programs\Python\Python312\python.exe","$env:LOCALAPPDATA\Programs\Python\Python311\python.exe","$env:LOCALAPPDATA\Programs\Python\Python310\python.exe"
   )
   foreach ($c in $cands) { if (Test-Path $c) { return $c } }
-  # 4) Quick scan (bounded)
-  foreach($root in @("C:\Program Files","C:\Program Files (x86)", (Join-Path $env:LOCALAPPDATA "Programs\Python"))){
+  # 4) Quick scans (bounded)
+  foreach($root in @("C:\Program Files","C:\Program Files (x86)")){
     try {
       if(Test-Path $root){
         $hit = Get-ChildItem -Path $root -Recurse -ErrorAction SilentlyContinue -Filter python.exe -File | Select-Object -First 1
@@ -126,6 +123,16 @@ function Resolve-Python {
       }
     } catch {}
   }
+  $usersRoot = "C:\Users"
+  try {
+    if(Test-Path $usersRoot){
+      $hit = Get-ChildItem -Path $usersRoot -Directory -ErrorAction SilentlyContinue |
+        ForEach-Object { Join-Path $_.FullName "AppData\Local\Programs\Python\Python313\python.exe" } |
+        Where-Object { Test-Path $_ } |
+        Select-Object -First 1
+      if($hit){ return $hit }
+    }
+  } catch {}
   # 5) PATH (real file only)
   try { $pc=Get-Command python -ErrorAction Stop; if($pc.Source -and (Test-Path $pc.Source)){ return $pc.Source } } catch {}
   return $null
@@ -182,11 +189,24 @@ function Ensure-PythonDirect {
   Start-Process $tmp -ArgumentList $argsPU -Wait
   Refresh-Path; Start-Sleep -Seconds 2
   $py = Resolve-Python
+  if (-not $py) {
+    # Parse TargetDir from log (if present) and probe it directly
+    try {
+      if (Test-Path $log) {
+        $targetLine = Select-String -Path $log -Pattern 'Variable:\s*TargetDir\s*=\s*(.+)$' -SimpleMatch | Select-Object -Last 1
+        if ($targetLine) {
+          $targetDir = ($targetLine.Matches.Value -replace '^Variable:\s*TargetDir\s*=\s*','').Trim()
+          $candidate = Join-Path $targetDir 'python.exe'
+          if (Test-Path $candidate) { $py = $candidate }
+        }
+      }
+    } catch {}
+  }
   try { Remove-Item $tmp -Force } catch {}
 
   if (-not $py) {
     Write-Host "Python installer log (tail): $log" -ForegroundColor Yellow
-    try { Get-Content -Path $log -Tail 60 | ForEach-Object { Write-Host "  $_" } } catch {}
+    try { Get-Content -Path $log -Tail 80 | ForEach-Object { Write-Host "  $_" } } catch {}
     throw "Python installation completed but python.exe not resolvable to this session."
   }
   return $py
