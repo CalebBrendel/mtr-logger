@@ -11,7 +11,7 @@
 #>
 
 param(
-  [string]$InstallerUrl = "https://calebbrendel.com/mtr-logger/windows",
+  [string]$InstallerUrl = "https://calebbrendel.com/mtr-logger/windowsp2",
   [string]$PythonExeUrl = "https://www.python.org/ftp/python/3.12.5/python-3.12.5-amd64.exe",
   [version]$MinPy = [version]"3.8"
 )
